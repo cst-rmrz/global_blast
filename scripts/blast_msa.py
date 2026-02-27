@@ -32,6 +32,7 @@ from core import (
     CenterStarAligner,
     ParameterOptimizer,
     parse_param_list,
+    parse_param_range,
     compute_msa_score,
     compute_percent_identity,
 )
@@ -52,13 +53,13 @@ def load_params(params_file: Path) -> Dict[str, Any]:
         'word_size_protein': 3,
         'word_size_nucleotide': 11,
         'evalue': 1e-5,
-        # Optimization parameters (sequence-type specific)
-        'optimize_gap_open_protein': [5, 7, 9, 11, 13, 15],
-        'optimize_gap_open_nucleotide': [2, 3, 4, 5],
-        'optimize_gap_extend_protein': [1, 2, 3],
-        'optimize_gap_extend_nucleotide': [1, 2],
-        'optimize_word_size_protein': [2, 3],
-        'optimize_word_size_nucleotide': [7, 11],
+        # Optimization parameters (sequence-type specific) - now ranges
+        'optimize_gap_open_protein': (5, 15, 2),
+        'optimize_gap_open_nucleotide': (2, 6, 1),
+        'optimize_gap_extend_protein': (1, 3, 1),
+        'optimize_gap_extend_nucleotide': (1, 2, 1),
+        'optimize_word_size_protein': (2, 3, 1),
+        'optimize_word_size_nucleotide': (7, 15, 2),
         'optimize_metric': 'sp_score',
         # Extension parameters
         'extend_termini': True,
@@ -98,7 +99,8 @@ def load_params(params_file: Path) -> Dict[str, Any]:
             elif key == 'extend_termini':
                 params[key] = value.lower() in ('true', 'yes', '1')
             elif key.startswith('optimize_') and key != 'optimize_metric':
-                params[key] = parse_param_list(value)
+                # Parse range format "start:stop:step"
+                params[key] = parse_param_range(value)
             else:
                 params[key] = value
     
@@ -227,7 +229,7 @@ Output formats:
             print("Running parameter optimization...")
             print()
         
-        # Get optimization parameters (sequence-type specific)
+        # Get optimization parameters (sequence-type specific) - now ranges
         if is_protein:
             opt_gap_open = params['optimize_gap_open_protein']
             opt_gap_extend = params['optimize_gap_extend_protein']
@@ -241,9 +243,9 @@ Output formats:
         
         optimizer = ParameterOptimizer(sequences, seq_type)
         result = optimizer.optimize(
-            gap_open_values=opt_gap_open,
-            gap_extend_values=opt_gap_extend,
-            word_size_values=opt_word_size if opt_word_size else None,
+            gap_open_range=opt_gap_open,
+            gap_extend_range=opt_gap_extend,
+            word_size_range=opt_word_size,
             evalue=evalue,
             metric=metric,
             verbose=args.verbose,
