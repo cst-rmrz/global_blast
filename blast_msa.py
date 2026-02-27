@@ -22,7 +22,7 @@ import io
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from core import (
+from scripts import (
     parse_fasta,
     detect_sequence_type,
     write_alignment,
