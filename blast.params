@@ -1,0 +1,66 @@
+# BLAST MSA Default Parameters
+# Edit these values to change default behavior
+# Lines starting with # are comments
+
+# =============================================================================
+# BLAST Algorithm Parameters
+# =============================================================================
+
+# Gap opening penalty (positive integer, cost subtracted for opening a gap)
+# Note: blastn and blastp have different valid combinations
+gap_open_protein = 11
+gap_open_nucleotide = 5
+
+# Gap extension penalty (positive integer, cost per gap position)
+# Note: For blastn with default scoring (1,-2), valid combos include:
+#   5/2, 4/2, 2/2, 1/2, 0/2, 3/1, 2/1, 1/1
+gap_extend_protein = 1
+gap_extend_nucleotide = 2
+
+# Word size for initial seeding
+# Protein: typically 2-3, Nucleotide: typically 7-11
+word_size_protein = 3
+word_size_nucleotide = 11
+
+# E-value threshold for considering alignments
+evalue = 1e-5
+
+# =============================================================================
+# Optimization Parameters (used when --optimize flag is set)
+# =============================================================================
+
+# Gap open penalties to test (comma-separated)
+optimize_gap_open_protein = 5,7,9,11,13,15
+optimize_gap_open_nucleotide = 2,3,4,5
+
+# Gap extend penalties to test (comma-separated)
+optimize_gap_extend_protein = 1,2,3
+optimize_gap_extend_nucleotide = 1,2
+
+# Word sizes to test (comma-separated)
+# Leave empty to use fixed word size during optimization
+optimize_word_size_protein = 2,3
+optimize_word_size_nucleotide = 7,11
+
+# Scoring metric for optimization: sp_score, column_score, percent_identity
+optimize_metric = sp_score
+
+# =============================================================================
+# Alignment Extension Parameters
+# =============================================================================
+
+# Extend alignments to sequence termini
+extend_termini = true
+
+# Penalty for terminal gaps (0 = free terminal gaps, typical for MSA)
+terminal_gap_penalty = 0
+
+# =============================================================================
+# Output Parameters
+# =============================================================================
+
+# Default output format: fasta, phylip, phylip-relaxed, clustal, nexus
+default_format = fasta
+
+# Wrap width for sequence output (0 = no wrapping)
+wrap_width = 80
