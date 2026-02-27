@@ -18,9 +18,8 @@ from typing import Dict, Any, Optional
 import configparser
 import io
 
-# Add script directory to path for imports (handles running from any location)
-SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent))
 
 from core import (
     parse_fasta,
@@ -157,8 +156,6 @@ Output formats:
                        help='Verbose output')
     parser.add_argument('--stats', action='store_true',
                        help='Print alignment statistics')
-    parser.add_argument('-t', '--threads', type=int, default=None,
-                       help='Number of parallel threads (default: CPU count - 1)')
     
     args = parser.parse_args()
     
@@ -171,7 +168,7 @@ Output formats:
     if args.params:
         params_file = args.params
     else:
-        params_file = SCRIPT_DIR / 'blast.params'
+        params_file = Path(__file__).parent / 'blast.params'
     
     params = load_params(params_file)
     
@@ -246,8 +243,7 @@ Output formats:
             word_size_values=opt_word_size if opt_word_size else None,
             evalue=evalue,
             metric=metric,
-            verbose=args.verbose,
-            threads=args.threads
+            verbose=args.verbose
         )
         
         alignment = result.best_alignment
@@ -274,8 +270,7 @@ Output formats:
                 gap_extend=gap_extend,
                 word_size=word_size,
                 evalue=evalue,
-                verbose=args.verbose,
-                threads=args.threads
+                verbose=args.verbose
             )
         
         if args.verbose:
