@@ -62,7 +62,8 @@ class ParameterOptimizer:
                  word_size_values: Optional[List[int]] = None,
                  evalue: float = 1e-5,
                  metric: str = 'sp_score',
-                 verbose: bool = False) -> OptimizationResult:
+                 verbose: bool = False,
+                 threads: int = None) -> OptimizationResult:
         """
         Run parameter optimization.
         
@@ -129,7 +130,8 @@ class ParameterOptimizer:
                     gap_extend=gap_extend,
                     word_size=word_size,
                     evalue=evalue,
-                    verbose=False
+                    verbose=False,
+                    threads=threads
                 )
                 
                 # Build MSA

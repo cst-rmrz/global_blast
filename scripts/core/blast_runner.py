@@ -13,6 +13,8 @@ import shutil
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 import os
 
 from .sequence_io import Sequence, SeqType
@@ -40,6 +42,101 @@ class BlastHit:
     @property
     def subject_len_aligned(self) -> int:
         return self.subject_end - self.subject_start + 1
+
+
+def _run_single_blast(args: Tuple) -> Tuple[Tuple[str, str], Optional[BlastHit], Optional[BlastHit]]:
+    """
+    Worker function for parallel BLAST execution.
+    
+    Args:
+        args: Tuple of (seq1_id, seq1_seq, seq2_id, seq2_seq, blast_cmd, gap_open, gap_extend, word_size, evalue, temp_dir)
+    
+    Returns:
+        Tuple of ((id1, id2), forward_hit, reverse_hit)
+    """
+    (seq1_id, seq1_seq, seq2_id, seq2_seq, 
+     blast_cmd, gap_open, gap_extend, word_size, evalue, temp_dir) = args
+    
+    # Create unique temp files for this pair
+    import uuid
+    pair_id = uuid.uuid4().hex[:8]
+    query_path = Path(temp_dir) / f'query_{pair_id}.fasta'
+    subject_path = Path(temp_dir) / f'subject_{pair_id}.fasta'
+    
+    try:
+        # Write sequences
+        with open(query_path, 'w') as f:
+            f.write(f">{seq1_id}\n{seq1_seq}\n")
+        with open(subject_path, 'w') as f:
+            f.write(f">{seq2_id}\n{seq2_seq}\n")
+        
+        # Run forward BLAST (seq1 vs seq2)
+        hit_forward = _execute_blast(
+            query_path, subject_path, blast_cmd,
+            gap_open, gap_extend, word_size, evalue
+        )
+        
+        # Run reverse BLAST (seq2 vs seq1)
+        hit_reverse = _execute_blast(
+            subject_path, query_path, blast_cmd,
+            gap_open, gap_extend, word_size, evalue
+        )
+        
+        return ((seq1_id, seq2_id), hit_forward, hit_reverse)
+    
+    finally:
+        # Clean up temp files
+        if query_path.exists():
+            query_path.unlink()
+        if subject_path.exists():
+            subject_path.unlink()
+
+
+def _execute_blast(query_path: Path, subject_path: Path, blast_cmd: str,
+                   gap_open: int, gap_extend: int, word_size: int, 
+                   evalue: float) -> Optional[BlastHit]:
+    """Execute a single BLAST command and parse result."""
+    cmd = [
+        blast_cmd,
+        '-query', str(query_path),
+        '-subject', str(subject_path),
+        '-gapopen', str(gap_open),
+        '-gapextend', str(gap_extend),
+        '-word_size', str(word_size),
+        '-evalue', str(evalue),
+        '-outfmt', '6 qseqid sseqid qstart qend sstart send qseq sseq evalue bitscore pident',
+        '-max_target_seqs', '1',
+        '-max_hsps', '1'
+    ]
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        return None
+    
+    output = result.stdout.strip()
+    if not output:
+        return None
+    
+    line = output.split('\n')[0]
+    fields = line.split('\t')
+    
+    if len(fields) < 11:
+        return None
+    
+    return BlastHit(
+        query_id=fields[0],
+        subject_id=fields[1],
+        query_start=int(fields[2]),
+        query_end=int(fields[3]),
+        subject_start=int(fields[4]),
+        subject_end=int(fields[5]),
+        query_seq=fields[6],
+        subject_seq=fields[7],
+        evalue=float(fields[8]),
+        bitscore=float(fields[9]),
+        identity=float(fields[10])
+    )
 
 
 class BlastRunner:
@@ -136,93 +233,72 @@ class BlastRunner:
         if word_size is None:
             word_size = 3 if self.seq_type == SeqType.PROTEIN else 11
         
-        # Build BLAST command
-        # Output format 6: tabular with specific columns
-        # qseqid sseqid qstart qend sstart send qseq sseq evalue bitscore pident
-        cmd = [
-            self.blast_cmd,
-            '-query', str(query_path),
-            '-subject', str(subject_path),
-            '-gapopen', str(gap_open),
-            '-gapextend', str(gap_extend),
-            '-word_size', str(word_size),
-            '-evalue', str(evalue),
-            '-outfmt', '6 qseqid sseqid qstart qend sstart send qseq sseq evalue bitscore pident',
-            '-max_target_seqs', '1',
-            '-max_hsps', '1'  # Only best HSP
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            # BLAST can return non-zero for no hits, check stderr
-            if 'BLAST Database error' in result.stderr:
-                raise RuntimeError(f"BLAST error: {result.stderr}")
-            return None
-        
-        # Parse output
-        output = result.stdout.strip()
-        if not output:
-            return None
-        
-        # Take first (best) hit
-        line = output.split('\n')[0]
-        fields = line.split('\t')
-        
-        if len(fields) < 11:
-            return None
-        
-        return BlastHit(
-            query_id=fields[0],
-            subject_id=fields[1],
-            query_start=int(fields[2]),
-            query_end=int(fields[3]),
-            subject_start=int(fields[4]),
-            subject_end=int(fields[5]),
-            query_seq=fields[6],
-            subject_seq=fields[7],
-            evalue=float(fields[8]),
-            bitscore=float(fields[9]),
-            identity=float(fields[10])
+        return _execute_blast(
+            query_path, subject_path, self.blast_cmd,
+            gap_open, gap_extend, word_size, evalue
         )
     
     def run_all_pairwise(self, sequences: List[Sequence],
                          gap_open: int = 11, gap_extend: int = 1,
                          word_size: int = None, evalue: float = 1e-5,
-                         verbose: bool = False) -> Dict[Tuple[str, str], BlastHit]:
+                         verbose: bool = False,
+                         threads: int = None) -> Dict[Tuple[str, str], BlastHit]:
         """
-        Run all pairwise BLASTs between sequences.
+        Run all pairwise BLASTs between sequences in parallel.
         
         Returns a dictionary mapping (query_id, subject_id) tuples to BlastHit objects.
         """
-        hits = {}
-        n_seqs = len(sequences)
-        total_pairs = n_seqs * (n_seqs - 1) // 2
+        if not self._check_blast_installed():
+            raise RuntimeError("BLAST+ not found.")
         
-        pair_count = 0
-        for i, seq1 in enumerate(sequences):
-            for j, seq2 in enumerate(sequences):
-                if i >= j:
-                    continue
-                
-                pair_count += 1
+        # Set default word size if not specified
+        if word_size is None:
+            word_size = 3 if self.seq_type == SeqType.PROTEIN else 11
+        
+        # Determine number of threads
+        if threads is None:
+            threads = max(1, multiprocessing.cpu_count() - 1)
+        
+        # Build list of all pairs to process
+        pairs = []
+        n_seqs = len(sequences)
+        for i in range(n_seqs):
+            for j in range(i + 1, n_seqs):
+                pairs.append((
+                    sequences[i].id, sequences[i].seq,
+                    sequences[j].id, sequences[j].seq,
+                    self.blast_cmd, gap_open, gap_extend, word_size, evalue,
+                    self.temp_dir
+                ))
+        
+        total_pairs = len(pairs)
+        
+        if verbose:
+            print(f"  Running {total_pairs} pairwise BLASTs using {threads} threads...")
+        
+        hits = {}
+        completed = 0
+        
+        # Run in parallel
+        with ProcessPoolExecutor(max_workers=threads) as executor:
+            futures = {executor.submit(_run_single_blast, pair): pair for pair in pairs}
+            
+            for future in as_completed(futures):
+                completed += 1
                 if verbose:
-                    print(f"\r  BLAST pair {pair_count}/{total_pairs}: {seq1.id} vs {seq2.id}",
-                          end='', flush=True)
+                    print(f"\r  Completed {completed}/{total_pairs} pairs", end='', flush=True)
                 
-                # Run BLAST in both directions and keep best
-                hit_forward = self.run_pairwise(
-                    seq1, seq2, gap_open, gap_extend, word_size, evalue
-                )
-                hit_reverse = self.run_pairwise(
-                    seq2, seq1, gap_open, gap_extend, word_size, evalue
-                )
-                
-                # Store both directions if found
-                if hit_forward:
-                    hits[(seq1.id, seq2.id)] = hit_forward
-                if hit_reverse:
-                    hits[(seq2.id, seq1.id)] = hit_reverse
+                try:
+                    (id1, id2), hit_forward, hit_reverse = future.result()
+                    
+                    if hit_forward:
+                        hits[(id1, id2)] = hit_forward
+                    if hit_reverse:
+                        hits[(id2, id1)] = hit_reverse
+                        
+                except Exception as e:
+                    if verbose:
+                        print(f"\n  Warning: pair failed: {e}")
         
         if verbose:
             print()  # Newline after progress
