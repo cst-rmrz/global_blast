@@ -10,5 +10,5 @@ from .alignment import (
     compute_msa_score, compute_percent_identity, compute_column_score,
 )
 from .optimizer import (
-    ParameterOptimizer, OptimizationResult, parse_param_list,
+    ParameterOptimizer, OptimizationResult, parse_param_list, parse_param_range,
 )
