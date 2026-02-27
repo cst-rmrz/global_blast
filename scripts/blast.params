@@ -27,20 +27,23 @@ evalue = 1e-5
 
 # =============================================================================
 # Optimization Parameters (used when --optimize flag is set)
+# Format: start:stop:step (inclusive)
 # =============================================================================
 
-# Gap open penalties to test (comma-separated)
-optimize_gap_open_protein = 5,7,9,11,13,15
-optimize_gap_open_nucleotide = 2,3,4,5
+# Gap open penalties to sweep
+# Protein: typically 5-15, Nucleotide: 2-6 (constrained by BLAST scoring)
+optimize_gap_open_protein = 5:15:2
+optimize_gap_open_nucleotide = 2:6:1
 
-# Gap extend penalties to test (comma-separated)
-optimize_gap_extend_protein = 1,2,3
-optimize_gap_extend_nucleotide = 1,2
+# Gap extend penalties to sweep
+# Protein: typically 1-3, Nucleotide: 1-2 (constrained by BLAST scoring)
+optimize_gap_extend_protein = 1:3:1
+optimize_gap_extend_nucleotide = 1:2:1
 
-# Word sizes to test (comma-separated)
-# Leave empty to use fixed word size during optimization
-optimize_word_size_protein = 2,3
-optimize_word_size_nucleotide = 7,11
+# Word sizes to sweep
+# Protein: 2-3, Nucleotide: 7-15
+optimize_word_size_protein = 2:3:1
+optimize_word_size_nucleotide = 7:15:2
 
 # Scoring metric for optimization: sp_score, column_score, percent_identity
 optimize_metric = sp_score
