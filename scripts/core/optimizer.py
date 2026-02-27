@@ -16,8 +16,11 @@ import sys
 import numpy as np
 from scipy.optimize import curve_fit
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+
 from .sequence_io import Sequence, Alignment, SeqType
-from .blast_runner import BlastRunner, BlastHit
+from .blast_runner import BlastRunner, BlastHit, _run_single_blast
 from .alignment import (
     CenterStarAligner, 
     compute_msa_score, 
@@ -236,26 +239,37 @@ class ParameterOptimizer:
     
     def _run_reference_alignments(self, runner: BlastRunner,
                                    gap_open: int, gap_extend: int,
-                                   word_size: int, evalue: float) -> float:
+                                   word_size: int, evalue: float,
+                                   threads: int = 1,
+                                   verbose: bool = False) -> float:
         """Run alignments from reference to all other sequences and return total score."""
+        pairs = [
+            (
+                self.reference_seq.id, self.reference_seq.seq,
+                other.id, other.seq,
+                runner.blast_cmd, gap_open, gap_extend, word_size, evalue,
+                runner.temp_dir
+            )
+            for other in self.other_seqs
+        ]
+
+        total = len(pairs)
+        completed = 0
         hits = {}
-        
-        for other in self.other_seqs:
-            # Run BLAST in both directions
-            hit_forward = runner.run_pairwise(
-                self.reference_seq, other,
-                gap_open, gap_extend, word_size, evalue
-            )
-            hit_reverse = runner.run_pairwise(
-                other, self.reference_seq,
-                gap_open, gap_extend, word_size, evalue
-            )
-            
-            if hit_forward:
-                hits[(self.reference_seq.id, other.id)] = hit_forward
-            if hit_reverse:
-                hits[(other.id, self.reference_seq.id)] = hit_reverse
-        
+        with ProcessPoolExecutor(max_workers=threads) as executor:
+            futures = {executor.submit(_run_single_blast, pair): pair for pair in pairs}
+            for future in as_completed(futures):
+                completed += 1
+                if verbose:
+                    print(f"\r    Completed {completed}/{total} pairs", end='', flush=True)
+                (id1, id2), hit_forward, hit_reverse = future.result()
+                if hit_forward:
+                    hits[(id1, id2)] = hit_forward
+                if hit_reverse:
+                    hits[(id2, id1)] = hit_reverse
+
+        if verbose:
+            print()  # newline after progress
         return self._compute_reference_score(hits)
     
     def optimize(self,
@@ -276,13 +290,16 @@ class ParameterOptimizer:
             evalue: E-value threshold
             metric: Scoring metric (used for final MSA evaluation)
             verbose: Print progress
-            threads: Number of threads (not used in univariate mode)
+            threads: Number of parallel BLAST workers per parameter evaluation
         
         Returns:
             OptimizationResult with best alignment and parameters
         """
         scoring_fn = get_scoring_function(metric)
-        
+
+        if threads is None:
+            threads = max(1, multiprocessing.cpu_count() - 1)
+
         # Generate parameter value lists from ranges
         gap_open_values = list(range(gap_open_range[0], gap_open_range[1] + 1, gap_open_range[2]))
         gap_extend_values = list(range(gap_extend_range[0], gap_extend_range[1] + 1, gap_extend_range[2]))
@@ -333,22 +350,24 @@ class ParameterOptimizer:
                     test_params[param_name] = val
                     
                     if verbose:
-                        print(f"  {param_name}={val}", end='', flush=True)
-                    
+                        print(f"  {param_name}={val}")
+
                     # Run reference alignments with these parameters
                     score = self._run_reference_alignments(
                         runner,
                         gap_open=test_params['gap_open'],
                         gap_extend=test_params['gap_extend'],
                         word_size=test_params['word_size'],
-                        evalue=evalue
+                        evalue=evalue,
+                        threads=threads,
+                        verbose=verbose
                     )
-                    
+
                     scores.append(score)
                     all_results.append((test_params.copy(), score))
-                    
+
                     if verbose:
-                        print(f" -> score: {score:.1f}")
+                        print(f"    score: {score:.1f}")
                 
                 # Fit logistic curve and find optimal value
                 optimal_val, smoothed_score, fit_details = fit_logistic_and_find_optimum(
