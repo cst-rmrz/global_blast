@@ -139,31 +139,6 @@ def _execute_blast(query_path: Path, subject_path: Path, blast_cmd: str,
     )
 
 
-def _parse_blast_output(output: str) -> List[BlastHit]:
-    """Parse tabular BLAST output into list of BlastHit objects."""
-    hits = []
-    for line in output.strip().split('\n'):
-        if not line:
-            continue
-        fields = line.split('\t')
-        if len(fields) < 11:
-            continue
-        hits.append(BlastHit(
-            query_id=fields[0],
-            subject_id=fields[1],
-            query_start=int(fields[2]),
-            query_end=int(fields[3]),
-            subject_start=int(fields[4]),
-            subject_end=int(fields[5]),
-            query_seq=fields[6],
-            subject_seq=fields[7],
-            evalue=float(fields[8]),
-            bitscore=float(fields[9]),
-            identity=float(fields[10])
-        ))
-    return hits
-
-
 class BlastRunner:
     """
     Manages BLAST execution for MSA construction.
@@ -203,8 +178,8 @@ class BlastRunner:
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
     
-    def create_database(self, sequences: List[Sequence], db_name: str = 'blastdb') -> Path:
-        """Create a BLAST database from sequences."""
+    def create_database(self, sequences: List[Sequence]) -> Path:
+        """Create a BLAST database from sequences"""
         if not self._check_blast_installed():
             raise RuntimeError(
                 "BLAST+ not found. Please install NCBI BLAST+ tools.\n"
@@ -214,19 +189,19 @@ class BlastRunner:
             )
         
         # Write sequences to temp FASTA
-        fasta_path = Path(self.temp_dir) / f'{db_name}.fasta'
+        fasta_path = Path(self.temp_dir) / 'sequences.fasta'
         with open(fasta_path, 'w') as f:
             for seq in sequences:
                 f.write(f">{seq.id}\n{seq.seq}\n")
         
         # Create BLAST database
-        db_path = Path(self.temp_dir) / db_name
+        self.db_path = Path(self.temp_dir) / 'blastdb'
         
         cmd = [
             'makeblastdb',
             '-in', str(fasta_path),
             '-dbtype', self.makedb_type,
-            '-out', str(db_path),
+            '-out', str(self.db_path),
             '-parse_seqids'
         ]
         
@@ -234,98 +209,7 @@ class BlastRunner:
         if result.returncode != 0:
             raise RuntimeError(f"makeblastdb failed: {result.stderr}")
         
-        return db_path
-    
-    def run_against_database(self, queries: List[Sequence], db_path: Path,
-                              gap_open: int, gap_extend: int, word_size: int,
-                              evalue: float, threads: int = 1) -> Dict[Tuple[str, str], BlastHit]:
-        """
-        Run all query sequences against a BLAST database in a single call.
-        
-        This is much more efficient than individual pairwise BLASTs:
-        - Single subprocess spawn
-        - BLAST handles internal parallelization
-        - Database index is built once and reused
-        
-        Returns:
-            Dictionary mapping (query_id, subject_id) to BlastHit
-        """
-        if not queries:
-            return {}
-        
-        # Write all queries to single FASTA
-        query_path = Path(self.temp_dir) / 'queries.fasta'
-        with open(query_path, 'w') as f:
-            for seq in queries:
-                f.write(f">{seq.id}\n{seq.seq}\n")
-        
-        # Run BLAST with all queries at once
-        # Use max_target_seqs equal to number of sequences to get all hits
-        n_seqs = len(queries)
-        cmd = [
-            self.blast_cmd,
-            '-query', str(query_path),
-            '-db', str(db_path),
-            '-gapopen', str(gap_open),
-            '-gapextend', str(gap_extend),
-            '-word_size', str(word_size),
-            '-evalue', str(evalue),
-            '-outfmt', '6 qseqid sseqid qstart qend sstart send qseq sseq evalue bitscore pident',
-            '-max_target_seqs', str(max(n_seqs + 5, 10)),  # Get enough hits
-            '-max_hsps', '1',
-            '-num_threads', str(threads)
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode != 0 and 'error' in result.stderr.lower():
-            raise RuntimeError(f"BLAST failed: {result.stderr}")
-        
-        # Parse results - keep best hit per query-subject pair
-        hits = {}
-        for hit in _parse_blast_output(result.stdout):
-            # Skip self-hits
-            if hit.query_id == hit.subject_id:
-                continue
-            
-            key = (hit.query_id, hit.subject_id)
-            # Keep hit with best bitscore if we see the same pair twice
-            if key not in hits or hit.bitscore > hits[key].bitscore:
-                hits[key] = hit
-        
-        return hits
-    
-    def run_reference_vs_others(self, reference: Sequence, others: List[Sequence],
-                                 gap_open: int, gap_extend: int, word_size: int,
-                                 evalue: float, threads: int = None) -> Dict[Tuple[str, str], BlastHit]:
-        """
-        Efficiently align a reference sequence against all others.
-        
-        Creates a database from the reference, then BLASTs all others against it.
-        Also runs the reverse (others as DB, reference as query) to get both directions.
-        
-        This is optimized for the center-star MSA approach and parameter optimization.
-        """
-        if threads is None:
-            threads = max(1, multiprocessing.cpu_count() - 1)
-        
-        hits = {}
-        
-        # Forward: others query against reference DB
-        ref_db = self.create_database([reference], db_name='ref_db')
-        forward_hits = self.run_against_database(
-            others, ref_db, gap_open, gap_extend, word_size, evalue, threads
-        )
-        hits.update(forward_hits)
-        
-        # Reverse: reference query against others DB
-        others_db = self.create_database(others, db_name='others_db')
-        reverse_hits = self.run_against_database(
-            [reference], others_db, gap_open, gap_extend, word_size, evalue, threads
-        )
-        hits.update(reverse_hits)
-        
-        return hits
+        return self.db_path
     
     def run_pairwise(self, query: Sequence, subject: Sequence,
                      gap_open: int = 11, gap_extend: int = 1,
@@ -360,10 +244,7 @@ class BlastRunner:
                          verbose: bool = False,
                          threads: int = None) -> Dict[Tuple[str, str], BlastHit]:
         """
-        Run all pairwise BLASTs between sequences.
-        
-        Uses database approach: creates DB of all sequences, BLASTs each against it.
-        BLAST handles parallelization internally with -num_threads.
+        Run all pairwise BLASTs between sequences in parallel.
         
         Returns a dictionary mapping (query_id, subject_id) tuples to BlastHit objects.
         """
@@ -376,27 +257,52 @@ class BlastRunner:
         
         # Determine number of threads
         if threads is None:
-            threads = max(1, multiprocessing.cpu_count() - 1)
+            #threads = max(1, multiprocessing.cpu_count() - 1)
+            threads = max(1, multiprocessing.cpu_count())
         
+        # Build list of all pairs to process
+        pairs = []
         n_seqs = len(sequences)
-        total_pairs = n_seqs * (n_seqs - 1)  # Both directions
+        for i in range(n_seqs):
+            for j in range(i + 1, n_seqs):
+                pairs.append((
+                    sequences[i].id, sequences[i].seq,
+                    sequences[j].id, sequences[j].seq,
+                    self.blast_cmd, gap_open, gap_extend, word_size, evalue,
+                    self.temp_dir
+                ))
+        
+        total_pairs = len(pairs)
         
         if verbose:
-            print(f"  Creating BLAST database...")
+            print(f"  Running {total_pairs} pairwise BLASTs using {threads} threads...")
         
-        # Create database of all sequences
-        all_db = self.create_database(sequences, db_name='all_seqs_db')
+        hits = {}
+        completed = 0
+        
+        # Run in parallel
+        with ProcessPoolExecutor(max_workers=threads) as executor:
+            futures = {executor.submit(_run_single_blast, pair): pair for pair in pairs}
+            
+            for future in as_completed(futures):
+                completed += 1
+                if verbose:
+                    print(f"\r  Completed {completed}/{total_pairs} pairs", end='', flush=True)
+                
+                try:
+                    (id1, id2), hit_forward, hit_reverse = future.result()
+                    
+                    if hit_forward:
+                        hits[(id1, id2)] = hit_forward
+                    if hit_reverse:
+                        hits[(id2, id1)] = hit_reverse
+                        
+                except Exception as e:
+                    if verbose:
+                        print(f"\n  Warning: pair failed: {e}")
         
         if verbose:
-            print(f"  Running all-vs-all BLAST with {threads} threads...")
-        
-        # BLAST all sequences against the database
-        hits = self.run_against_database(
-            sequences, all_db, gap_open, gap_extend, word_size, evalue, threads
-        )
-        
-        if verbose:
-            print(f"  Found {len(hits)} pairwise alignments")
+            print()  # Newline after progress
         
         return hits
 
