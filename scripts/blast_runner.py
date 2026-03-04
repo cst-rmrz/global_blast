@@ -257,7 +257,8 @@ class BlastRunner:
         
         # Determine number of threads
         if threads is None:
-            threads = max(1, multiprocessing.cpu_count() - 1)
+            #threads = max(1, multiprocessing.cpu_count() - 1)
+            threads = max(1, multiprocessing.cpu_count())
         
         # Build list of all pairs to process
         pairs = []
