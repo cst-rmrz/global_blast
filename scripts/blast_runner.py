@@ -178,6 +178,49 @@ def _execute_blast(query_path: Path, subject_path: Path, blast_cmd: str,
     return best_hit
 
 
+def _retry_single_pair(args: Tuple) -> Tuple[Tuple[str, str], Optional[BlastHit], Optional[BlastHit]]:
+    """
+    Worker function for parallel coverage-guard retries.
+
+    Args:
+        args: Tuple of (id1, seq1, id2, seq2, blast_cmd, gap_open, gap_extend,
+              word_size, evalue, temp_dir)
+
+    Returns:
+        Tuple of ((id1, id2), forward_hit, reverse_hit)
+    """
+    (id1, seq1, id2, seq2,
+     blast_cmd, gap_open, gap_extend, word_size, evalue, temp_dir) = args
+
+    import uuid
+    pair_id = uuid.uuid4().hex[:8]
+    query_path = Path(temp_dir) / f'retry_{pair_id}_q.fasta'
+    subject_path = Path(temp_dir) / f'retry_{pair_id}_s.fasta'
+
+    try:
+        with open(query_path, 'w') as f:
+            f.write(f">{id1}\n{seq1}\n")
+        with open(subject_path, 'w') as f:
+            f.write(f">{id2}\n{seq2}\n")
+
+        fwd = _execute_blast(
+            query_path, subject_path, blast_cmd,
+            gap_open, gap_extend, word_size, evalue, max_hsps=3
+        )
+        rev = _execute_blast(
+            subject_path, query_path, blast_cmd,
+            gap_open, gap_extend, word_size, evalue, max_hsps=3
+        )
+
+        return ((id1, id2), fwd, rev)
+
+    finally:
+        if query_path.exists():
+            query_path.unlink()
+        if subject_path.exists():
+            subject_path.unlink()
+
+
 def _parse_blast_output(output: str) -> List[BlastHit]:
     """Parse tabular BLAST output into list of BlastHit objects."""
     hits = []
@@ -461,7 +504,8 @@ class BlastRunner:
                                   verbose: bool) -> Dict[Tuple[str, str], BlastHit]:
         """
         Retry BLAST for pairs where the alignment covers less than the threshold
-        of the query sequence. Uses more sensitive parameters and multiple HSPs.
+        of the query sequence. Uses more sensitive parameters, multiple HSPs,
+        and parallel execution via ProcessPoolExecutor.
         """
         seq_map = {s.id: s for s in sequences}
         low_coverage_pairs = set()
@@ -472,70 +516,57 @@ class BlastRunner:
                 continue
             coverage = hit.query_len_aligned / qlen
             if coverage < coverage_threshold:
-                # Track the canonical pair (alphabetically sorted) to avoid duplicates
                 pair = tuple(sorted([qid, sid]))
                 low_coverage_pairs.add(pair)
 
         if not low_coverage_pairs:
             return hits
 
+        n_pairs = len(low_coverage_pairs)
         if verbose:
-            print(f"  Coverage guard: {len(low_coverage_pairs)} pairs below "
+            print(f"  Coverage guard: {n_pairs} pairs below "
                   f"{coverage_threshold:.0%} coverage, retrying with sensitive parameters...")
 
-        # Sensitive parameters: lower word_size, higher e-value, multiple HSPs
+        # Sensitive parameters
         sensitive_word_size = max(7, original_word_size - 4) if self.seq_type != SeqType.PROTEIN else max(2, original_word_size - 1)
         sensitive_evalue = max(original_evalue, 1e-3)
+        sensitive_gap_open = 5 if self.seq_type != SeqType.PROTEIN else 11
+        sensitive_gap_extend = 2 if self.seq_type != SeqType.PROTEIN else 1
 
+        # Build args for parallel execution
+        retry_args = []
         for id1, id2 in low_coverage_pairs:
-            seq1 = seq_map[id1]
-            seq2 = seq_map[id2]
+            retry_args.append((
+                id1, seq_map[id1].seq, id2, seq_map[id2].seq,
+                self.blast_cmd, sensitive_gap_open, sensitive_gap_extend,
+                sensitive_word_size, sensitive_evalue, self.temp_dir
+            ))
 
-            # Write temp files for this pair
-            query_path = Path(self.temp_dir) / 'retry_query.fasta'
-            subject_path = Path(self.temp_dir) / 'retry_subject.fasta'
+        # Run retries in parallel
+        n_workers = min(n_pairs, max(1, multiprocessing.cpu_count()))
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {executor.submit(_retry_single_pair, args): args
+                       for args in retry_args}
 
-            with open(query_path, 'w') as f:
-                f.write(f">{seq1.id}\n{seq1.seq}\n")
-            with open(subject_path, 'w') as f:
-                f.write(f">{seq2.id}\n{seq2.seq}\n")
+            for future in as_completed(futures):
+                (id1, id2), new_fwd, new_rev = future.result()
 
-            # Try forward with multi-HSP
-            new_fwd = _execute_blast(
-                query_path, subject_path, self.blast_cmd,
-                gap_open=5 if self.seq_type != SeqType.PROTEIN else 11,
-                gap_extend=2 if self.seq_type != SeqType.PROTEIN else 1,
-                word_size=sensitive_word_size,
-                evalue=sensitive_evalue,
-                max_hsps=3
-            )
-            # Try reverse with multi-HSP
-            new_rev = _execute_blast(
-                subject_path, query_path, self.blast_cmd,
-                gap_open=5 if self.seq_type != SeqType.PROTEIN else 11,
-                gap_extend=2 if self.seq_type != SeqType.PROTEIN else 1,
-                word_size=sensitive_word_size,
-                evalue=sensitive_evalue,
-                max_hsps=3
-            )
+                for new_hit, key in [(new_fwd, (id1, id2)), (new_rev, (id2, id1))]:
+                    if new_hit is None:
+                        continue
+                    qlen = seq_lens.get(new_hit.query_id, 0)
+                    new_cov = new_hit.query_len_aligned / qlen if qlen > 0 else 0.0
 
-            # Replace hits if the new ones have better coverage
-            for new_hit, key in [(new_fwd, (id1, id2)), (new_rev, (id2, id1))]:
-                if new_hit is None:
-                    continue
-                qlen = seq_lens.get(new_hit.query_id, 0)
-                new_cov = new_hit.query_len_aligned / qlen if qlen > 0 else 0.0
+                    old_hit = hits.get(key)
+                    if old_hit is None:
+                        hits[key] = new_hit
+                        continue
 
-                old_hit = hits.get(key)
-                if old_hit is None:
-                    hits[key] = new_hit
-                    continue
-
-                old_cov = old_hit.query_len_aligned / seq_lens.get(old_hit.query_id, 1)
-                if new_cov > old_cov:
-                    hits[key] = new_hit
-                    if verbose:
-                        print(f"    {key[0]} vs {key[1]}: coverage {old_cov:.0%} -> {new_cov:.0%}")
+                    old_cov = old_hit.query_len_aligned / seq_lens.get(old_hit.query_id, 1)
+                    if new_cov > old_cov:
+                        hits[key] = new_hit
+                        if verbose:
+                            print(f"    {key[0]} vs {key[1]}: coverage {old_cov:.0%} -> {new_cov:.0%}")
 
         return hits
 
