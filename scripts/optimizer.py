@@ -294,7 +294,10 @@ class ParameterOptimizer:
                  metric: str = 'sp_score',
                  verbose: bool = False,
                  threads: int = None,
-                 aligner_class=None) -> OptimizationResult:
+                 aligner_class=None,
+                 optimize_max_hsps: bool = False,
+                 nw_threshold: float = 0.3,
+                 coverage_threshold: float = 0.5) -> OptimizationResult:
         """
         Run efficient parameter optimization.
         
@@ -453,7 +456,10 @@ class ParameterOptimizer:
         # Build final MSA with optimal parameters
         if verbose:
             print("Building final MSA with optimal parameters...")
-        
+
+        if aligner_class is None:
+            aligner_class = CenterStarAligner
+
         with BlastRunner(self.seq_type) as runner:
             hits = runner.run_all_pairwise(
                 self.sequences,
@@ -462,13 +468,51 @@ class ParameterOptimizer:
                 word_size=best_params['word_size'],
                 evalue=evalue,
                 verbose=verbose,
-                threads=threads
+                threads=threads,
+                coverage_threshold=coverage_threshold
             )
-        
-        if aligner_class is None:
-            aligner_class = CenterStarAligner
+            # Multi-HSP pass (needed for chaining and/or max_hsps sweep)
+            need_multi = nw_threshold > 0 or optimize_max_hsps
+            multi_hits = runner.run_all_pairwise_multi_hsp(
+                self.sequences,
+                gap_open=best_params['gap_open'],
+                gap_extend=best_params['gap_extend'],
+                word_size=best_params['word_size'],
+                evalue=evalue,
+                verbose=verbose,
+                threads=threads,
+                max_hsps=10
+            ) if need_multi else None
+
+        if optimize_max_hsps and multi_hits is not None:
+            if verbose:
+                print()
+                print("Optimizing max_hsps (1-10)...")
+            best_max_hsps = 1
+            best_hsps_score = float('-inf')
+            for n in range(1, 11):
+                trimmed = {k: v[:n] for k, v in multi_hits.items()}
+                aln = aligner_class(self.sequences, self.seq_type).build_msa(
+                    hits, multi_hits=trimmed, nw_threshold=nw_threshold, verbose=False
+                )
+                score = scoring_fn(aln)
+                pct_id = compute_percent_identity(aln)
+                if verbose:
+                    print(f"  max_hsps={n:2d}  length={aln.length:4d}  "
+                          f"sp_score={score:8.1f}  pct_id={pct_id:.2f}%")
+                if score > best_hsps_score:
+                    best_hsps_score = score
+                    best_max_hsps = n
+            if verbose:
+                print(f"  -> Best: max_hsps={best_max_hsps}")
+            best_params['max_hsps'] = best_max_hsps
+            multi_hits_final = {k: v[:best_max_hsps] for k, v in multi_hits.items()}
+        else:
+            multi_hits_final = multi_hits  # use all fetched HSPs as-is
+
         aligner = aligner_class(self.sequences, self.seq_type)
-        alignment = aligner.build_msa(hits, verbose=verbose)
+        alignment = aligner.build_msa(hits, multi_hits=multi_hits_final,
+                                      nw_threshold=nw_threshold, verbose=verbose)
         alignment.parameters = best_params.copy()
         
         # Score final alignment

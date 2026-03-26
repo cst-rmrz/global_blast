@@ -450,7 +450,7 @@ class BlastRunner:
 
         After initial BLAST, checks alignment coverage for each hit. Hits covering
         less than coverage_threshold of the query are retried with more sensitive
-        parameters (lower word_size, higher e-value, multiple HSPs).
+        parameters. Set coverage_threshold=0 to disable the coverage guard.
 
         Returns a dictionary mapping (query_id, subject_id) tuples to BlastHit objects.
         """

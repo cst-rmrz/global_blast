@@ -175,15 +175,18 @@ Output formats:
                        help='Maximum refinement iterations (default: 3)')
     parser.add_argument('--coverage-threshold', type=float, default=None,
                        help='Minimum alignment coverage to accept a BLAST hit (default: 0.5)')
+    parser.add_argument('--no-coverage-guard', action='store_true',
+                       help='Disable the coverage guard (skip retrying low-coverage pairs '
+                            'with sensitive parameters)')
     parser.add_argument('--nw-threshold', type=float, default=None,
                        help='BLAST coverage below which Needleman-Wunsch global alignment '
                             'is used instead of local BLAST extension. Helps sequences '
                             'with internal insertions that BLAST finds only partially. '
                             'Set to 0 to disable NW fallback (default: 0.3)')
     parser.add_argument('--optimize-hsps', action='store_true',
-                       help='Try max_hsps values 1-10 and pick the value that gives the '
-                            'best sum-of-pairs score. Runs one BLAST pass then builds '
-                            '10 alignments; use with --method to select algorithm.')
+                       help='Include max_hsps (1-10) as an optimization parameter. '
+                            'Requires --optimize. Runs one extra BLAST pass then builds '
+                            '10 alignments to pick the best chaining depth.')
     
     # Output options
     parser.add_argument('-v', '--verbose', action='store_true',
@@ -254,7 +257,8 @@ Output formats:
     
     evalue = args.evalue if args.evalue is not None else params['evalue']
 
-    coverage_threshold = (args.coverage_threshold if args.coverage_threshold is not None
+    coverage_threshold = (0 if args.no_coverage_guard
+                         else args.coverage_threshold if args.coverage_threshold is not None
                          else params['coverage_threshold'])
     nw_threshold = args.nw_threshold if args.nw_threshold is not None else 0.3
     refine = args.refine or params['refine']
@@ -290,7 +294,10 @@ Output formats:
             metric=metric,
             verbose=args.verbose,
             threads=args.threads,
-            aligner_class=aligner_class
+            aligner_class=aligner_class,
+            optimize_max_hsps=args.optimize_hsps,
+            nw_threshold=nw_threshold,
+            coverage_threshold=coverage_threshold
         )
 
         alignment = result.best_alignment
@@ -323,9 +330,7 @@ Output formats:
                 coverage_threshold=coverage_threshold
             )
             # Multi-HSP dict for chaining (handles internal insertions)
-            # Always fetch up to 10 when optimize-hsps is set; otherwise respect nw_threshold
-            need_multi = nw_threshold > 0 or args.optimize_hsps
-            if need_multi:
+            if nw_threshold > 0:
                 multi_hits = runner.run_all_pairwise_multi_hsp(
                     sequences,
                     gap_open=gap_open,
@@ -333,65 +338,27 @@ Output formats:
                     word_size=word_size,
                     evalue=evalue,
                     verbose=args.verbose,
-                    threads=args.threads,
-                    max_hsps=10
+                    threads=args.threads
                 )
             else:
                 multi_hits = None
 
-        if args.optimize_hsps:
-            # Try max_hsps values 1-10; pick the one with best sum-of-pairs score
-            if args.verbose:
-                print()
-                print("Optimizing max_hsps (1-10)...")
+        if args.verbose:
+            print()
+            print("Building MSA...")
 
-            best_score = float('-inf')
-            best_max_hsps = 1
-            best_alignment = None
-
-            for n in range(1, 11):
-                # Slice each pair's HSP list to at most n entries
-                trimmed = {k: v[:n] for k, v in multi_hits.items()} if multi_hits else None
-                aligner = aligner_class(sequences, seq_type)
-                aln = aligner.build_msa(hits, multi_hits=trimmed,
-                                        nw_threshold=nw_threshold, verbose=False)
-                score = compute_msa_score(aln)
-                pct_id = compute_percent_identity(aln)
-                if args.verbose:
-                    print(f"  max_hsps={n:2d}  length={aln.length:4d}  "
-                          f"sp_score={score:8.1f}  pct_id={pct_id:.2f}%")
-                if score > best_score:
-                    best_score = score
-                    best_max_hsps = n
-                    best_alignment = aln
-
-            if args.verbose:
-                print(f"  -> Best: max_hsps={best_max_hsps}  sp_score={best_score:.1f}")
-
-            alignment = best_alignment
-            alignment.parameters = {
-                'gap_open': gap_open,
-                'gap_extend': gap_extend,
-                'word_size': word_size,
-                'max_hsps': best_max_hsps
-            }
-        else:
-            if args.verbose:
-                print()
-                print("Building MSA...")
-
-            aligner = aligner_class(sequences, seq_type)
-            alignment = aligner.build_msa(
-                hits,
-                multi_hits=multi_hits,
-                nw_threshold=nw_threshold,
-                verbose=args.verbose
-            )
-            alignment.parameters = {
-                'gap_open': gap_open,
-                'gap_extend': gap_extend,
-                'word_size': word_size
-            }
+        aligner = aligner_class(sequences, seq_type)
+        alignment = aligner.build_msa(
+            hits,
+            multi_hits=multi_hits,
+            nw_threshold=nw_threshold,
+            verbose=args.verbose
+        )
+        alignment.parameters = {
+            'gap_open': gap_open,
+            'gap_extend': gap_extend,
+            'word_size': word_size
+        }
     
     # Iterative refinement (opt-in via --refine)
     if refine:

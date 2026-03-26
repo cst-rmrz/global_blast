@@ -237,7 +237,7 @@ def chain_blast_hsps(hsps: List[BlastHit],
     # Sort by query start position
     ordered = sorted(hsps, key=lambda h: h.query_start)
 
-    # Remove overlapping HSPs (keep higher bitscore)
+    # Remove query-overlapping HSPs (keep higher bitscore)
     clean: List[BlastHit] = [ordered[0]]
     for hsp in ordered[1:]:
         prev = clean[-1]
@@ -245,6 +245,17 @@ def chain_blast_hsps(hsps: List[BlastHit],
             clean.append(hsp)
         elif hsp.bitscore > prev.bitscore:
             clean[-1] = hsp
+
+    # Also remove subject-overlapping HSPs. Subject coords may not be
+    # monotonically increasing after query-order sorting, which would cause
+    # double-counting of subject residues and overflow right_g in _merge_profiles.
+    subject_clean: List[BlastHit] = [clean[0]]
+    for hsp in clean[1:]:
+        if hsp.subject_start > subject_clean[-1].subject_end:
+            subject_clean.append(hsp)
+        elif hsp.bitscore > subject_clean[-1].bitscore:
+            subject_clean[-1] = hsp
+    clean = subject_clean
 
     if len(clean) == 1:
         return extend_pairwise_alignment(clean[0], query_seq, subject_seq)
