@@ -8,6 +8,7 @@ from .blast_runner import (
 from .alignment import (
     CenterStarAligner, AlignedPair, extend_pairwise_alignment,
     compute_msa_score, compute_percent_identity, compute_column_score,
+    compute_per_sequence_identity, compute_hit_coverage, build_consensus,
 )
 from .optimizer import (
     ParameterOptimizer, OptimizationResult, parse_param_list, parse_param_range,

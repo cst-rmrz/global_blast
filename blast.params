@@ -49,6 +49,21 @@ optimize_word_size_nucleotide = 7:15:2
 optimize_metric = sp_score
 
 # =============================================================================
+# Refinement Parameters
+# =============================================================================
+
+# Enable iterative refinement (requires --refine flag or set to true here)
+refine = false
+
+# Maximum refinement iterations
+refine_iterations = 3
+
+# Minimum alignment coverage threshold (0.0-1.0)
+# Hits covering less than this fraction of the query are retried with
+# more sensitive parameters. Set to 0 to disable coverage guard.
+coverage_threshold = 0.5
+
+# =============================================================================
 # Alignment Extension Parameters
 # =============================================================================
 

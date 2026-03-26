@@ -10,7 +10,7 @@ from typing import List, Dict, Tuple, Optional
 from copy import deepcopy
 
 from .sequence_io import Sequence, Alignment, SeqType
-from .blast_runner import BlastHit
+from .blast_runner import BlastHit, BlastRunner
 
 
 @dataclass
@@ -412,8 +412,301 @@ class CenterStarAligner:
         
         return ''.join(result)
 
+    def refine_msa(self, alignment: Alignment,
+                   max_iterations: int = 3,
+                   verbose: bool = False) -> Alignment:
+        """
+        Iterative refinement: detect poorly-aligned sequences, remove them,
+        build consensus from remaining, re-BLAST against consensus, reinsert.
 
-def compute_msa_score(alignment: Alignment, 
+        Repeats until no sequences are flagged or max_iterations reached.
+        """
+        import numpy as np
+
+        current = alignment
+
+        for iteration in range(max_iterations):
+            scores = compute_per_sequence_identity(current)
+            if not scores:
+                break
+
+            values = list(scores.values())
+            mean_score = np.mean(values)
+            std_score = np.std(values)
+
+            # Flag sequences below mean - 1.5 * std
+            threshold = mean_score - 1.5 * std_score
+            poor_ids = [sid for sid, score in scores.items()
+                        if score < threshold and score < mean_score]
+
+            if not poor_ids:
+                if verbose:
+                    print(f"  Refinement iteration {iteration + 1}: "
+                          f"no poorly-aligned sequences detected")
+                break
+
+            if verbose:
+                print(f"  Refinement iteration {iteration + 1}: "
+                      f"realigning {len(poor_ids)} sequences "
+                      f"(threshold: {threshold:.1f}% identity)")
+                for sid in poor_ids:
+                    print(f"    {sid}: {scores[sid]:.1f}%")
+
+            # Build consensus from the good sequences
+            good_seqs = [s for s in current.sequences if s.id not in poor_ids]
+            good_alignment = Alignment(sequences=good_seqs, seq_type=current.seq_type)
+            consensus_seq = build_consensus(good_alignment, gap_threshold=0.5)
+
+            if not consensus_seq:
+                if verbose:
+                    print(f"  Could not build consensus, stopping refinement")
+                break
+
+            # Re-BLAST poor sequences against consensus
+            poor_seq_map = {s.id: s for s in self.sequences.values()
+                           if s.id in poor_ids}
+
+            # Sensitive parameters for realignment
+            sensitive_ws = 7 if self.seq_type != SeqType.PROTEIN else 2
+            sensitive_evalue = 1e-3
+
+            new_hits = {}
+            with BlastRunner(self.seq_type) as runner:
+                for sid, seq in poor_seq_map.items():
+                    hit = runner.run_vs_consensus(
+                        seq, consensus_seq,
+                        gap_open=5 if self.seq_type != SeqType.PROTEIN else 11,
+                        gap_extend=2 if self.seq_type != SeqType.PROTEIN else 1,
+                        word_size=sensitive_ws,
+                        evalue=sensitive_evalue
+                    )
+                    if hit:
+                        # The hit has subject_id='consensus', remap to center
+                        new_hits[(self.center_id, sid)] = BlastHit(
+                            query_id=hit.subject_id,
+                            subject_id=hit.query_id,
+                            query_start=hit.subject_start,
+                            query_end=hit.subject_end,
+                            subject_start=hit.query_start,
+                            subject_end=hit.query_end,
+                            query_seq=hit.subject_seq,
+                            subject_seq=hit.query_seq,
+                            evalue=hit.evalue,
+                            bitscore=hit.bitscore,
+                            identity=hit.identity
+                        )
+
+            if not new_hits:
+                if verbose:
+                    print(f"  No improved hits found, stopping refinement")
+                break
+
+            # Rebuild MSA: run full all-vs-all BLAST but replace hits for
+            # the poor sequences with the consensus-based hits
+            # Simpler approach: rebuild from the existing good alignment
+            # by re-extending the poor sequences with new hits
+
+            # Get the consensus as a Sequence for alignment extension
+            consensus_as_seq = Sequence(
+                id='_consensus_',
+                description='consensus',
+                seq=consensus_seq
+            )
+
+            # Build new pairwise alignments for poor sequences against consensus
+            refined_seqs = list(good_seqs)  # Start with good sequences as-is
+
+            for sid in poor_ids:
+                hit_key = (self.center_id, sid)
+                if hit_key in new_hits:
+                    hit = new_hits[hit_key]
+                    # Extend the pairwise alignment (consensus as query, poor seq as subject)
+                    pair = extend_pairwise_alignment(
+                        hit, consensus_seq, poor_seq_map[sid].seq
+                    )
+                    # The aligned subject is our refined sequence, but it's aligned
+                    # to the consensus which has the same coordinate space as the
+                    # good alignment. We need to insert it at the right position.
+
+                    # Map the consensus-aligned sequence back to the MSA columns
+                    aligned_seq = self._map_to_msa_columns(
+                        pair.seq2_aligned, pair.seq1_aligned, good_alignment
+                    )
+
+                    refined_seqs.append(Sequence(
+                        id=sid,
+                        description=poor_seq_map[sid].description,
+                        seq=aligned_seq
+                    ))
+                else:
+                    # Keep original if no new hit
+                    orig = next((s for s in current.sequences if s.id == sid), None)
+                    if orig:
+                        refined_seqs.append(orig)
+
+            # Validate all same length - pad with gaps if needed
+            max_len = max(len(s.seq) for s in refined_seqs)
+            for s in refined_seqs:
+                if len(s.seq) < max_len:
+                    s.seq = s.seq + '-' * (max_len - len(s.seq))
+
+            current = Alignment(
+                sequences=refined_seqs,
+                seq_type=current.seq_type,
+                parameters=current.parameters,
+                score=current.score
+            )
+
+        return current
+
+    def _map_to_msa_columns(self, seq_aligned_to_consensus: str,
+                             consensus_aligned: str,
+                             good_alignment: Alignment) -> str:
+        """
+        Map a sequence aligned to the consensus back into the MSA column space.
+
+        The consensus was built by stripping gap-heavy columns from the MSA.
+        We need to reverse that mapping: for each MSA column, determine whether
+        it contributed to the consensus, and if so, take the corresponding
+        character from the realigned sequence.
+        """
+        # Figure out which MSA columns contributed to the consensus
+        # (same logic as build_consensus: columns where gap fraction <= 0.5)
+        sequences = [s.seq for s in good_alignment.sequences]
+        n_seqs = len(sequences)
+
+        # Build mapping: msa_col -> consensus_position (or -1 if skipped)
+        consensus_pos = 0
+        msa_to_consensus = []
+        for col in range(good_alignment.length):
+            column = [seq[col] for seq in sequences]
+            gap_fraction = column.count('-') / n_seqs
+            if gap_fraction > 0.5:
+                msa_to_consensus.append(-1)  # This column was skipped
+            else:
+                msa_to_consensus.append(consensus_pos)
+                consensus_pos += 1
+
+        # Now map the consensus-aligned sequence back.
+        # consensus_aligned has the consensus with possible gaps from the pairwise alignment.
+        # seq_aligned_to_consensus is the poor sequence aligned to that.
+        # We need to walk through the consensus alignment to map positions.
+
+        # Build: for each ungapped consensus position, what character does the
+        # realigned sequence have?
+        seq_by_consensus_pos = {}
+        cons_pos = 0
+        for i in range(len(consensus_aligned)):
+            if consensus_aligned[i] != '-':
+                seq_by_consensus_pos[cons_pos] = seq_aligned_to_consensus[i]
+                cons_pos += 1
+            # If consensus has gap, the seq char is an insertion relative to
+            # consensus — we drop it to maintain MSA column structure
+
+        # Build the final MSA-column-aligned sequence
+        result = []
+        for col in range(good_alignment.length):
+            cpos = msa_to_consensus[col]
+            if cpos == -1:
+                # This MSA column was a gap-heavy column (not in consensus)
+                result.append('-')
+            elif cpos in seq_by_consensus_pos:
+                result.append(seq_by_consensus_pos[cpos])
+            else:
+                result.append('-')
+
+        return ''.join(result)
+
+
+def compute_hit_coverage(hit: BlastHit, query_len: int, subject_len: int) -> float:
+    """
+    Compute the fraction of the query sequence covered by the BLAST hit.
+    Returns a value between 0.0 and 1.0.
+    """
+    if query_len == 0:
+        return 0.0
+    return hit.query_len_aligned / query_len
+
+
+def compute_per_sequence_identity(alignment: Alignment) -> Dict[str, float]:
+    """
+    Compute average pairwise percent identity for each sequence against all others.
+
+    Returns dict mapping seq_id to its average identity (0-100).
+    Useful for identifying poorly-aligned sequences.
+    """
+    if not alignment.is_valid() or alignment.n_seqs < 2:
+        return {}
+
+    sequences = alignment.sequences
+    n_seqs = len(sequences)
+    scores = {}
+
+    for i in range(n_seqs):
+        total_identity = 0.0
+        n_pairs = 0
+
+        for j in range(n_seqs):
+            if i == j:
+                continue
+
+            matches = 0
+            aligned_positions = 0
+
+            for col in range(alignment.length):
+                c1, c2 = sequences[i].seq[col], sequences[j].seq[col]
+                if c1 != '-' and c2 != '-':
+                    aligned_positions += 1
+                    if c1 == c2:
+                        matches += 1
+
+            if aligned_positions > 0:
+                total_identity += matches / aligned_positions
+                n_pairs += 1
+
+        scores[sequences[i].id] = (total_identity / n_pairs * 100) if n_pairs > 0 else 0.0
+
+    return scores
+
+
+def build_consensus(alignment: Alignment, gap_threshold: float = 0.5) -> str:
+    """
+    Build a majority-rule consensus sequence from an MSA.
+
+    For each column:
+    - If gaps exceed gap_threshold fraction, the column is skipped (not included)
+    - Otherwise, the most common non-gap character is used
+
+    Returns the ungapped consensus string.
+    """
+    if not alignment.is_valid() or alignment.n_seqs == 0:
+        return ""
+
+    sequences = [s.seq for s in alignment.sequences]
+    n_seqs = len(sequences)
+    consensus = []
+
+    for col in range(alignment.length):
+        column = [seq[col] for seq in sequences]
+        gap_count = column.count('-')
+        gap_fraction = gap_count / n_seqs
+
+        if gap_fraction > gap_threshold:
+            continue
+
+        # Count non-gap characters
+        char_counts = {}
+        for c in column:
+            if c != '-':
+                char_counts[c] = char_counts.get(c, 0) + 1
+
+        if char_counts:
+            consensus.append(max(char_counts, key=char_counts.get))
+
+    return ''.join(consensus)
+
+
+def compute_msa_score(alignment: Alignment,
                       match_score: int = 1,
                       mismatch_score: int = -1,
                       gap_score: int = -1) -> float:

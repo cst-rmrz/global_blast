@@ -93,8 +93,8 @@ def _run_single_blast(args: Tuple) -> Tuple[Tuple[str, str], Optional[BlastHit],
 
 
 def _execute_blast(query_path: Path, subject_path: Path, blast_cmd: str,
-                   gap_open: int, gap_extend: int, word_size: int, 
-                   evalue: float) -> Optional[BlastHit]:
+                   gap_open: int, gap_extend: int, word_size: int,
+                   evalue: float, max_hsps: int = 1) -> Optional[BlastHit]:
     """Execute a single BLAST command and parse result."""
     cmd = [
         blast_cmd,
@@ -104,39 +104,78 @@ def _execute_blast(query_path: Path, subject_path: Path, blast_cmd: str,
         '-gapextend', str(gap_extend),
         '-word_size', str(word_size),
         '-evalue', str(evalue),
-        '-outfmt', '6 qseqid sseqid qstart qend sstart send qseq sseq evalue bitscore pident',
+        '-outfmt', '6 qseqid sseqid qstart qend sstart send qseq sseq evalue bitscore pident qlen slen',
         '-max_target_seqs', '1',
-        '-max_hsps', '1'
+        '-max_hsps', str(max_hsps)
     ]
-    
+
     result = subprocess.run(cmd, capture_output=True, text=True)
-    
+
     if result.returncode != 0:
         return None
-    
+
     output = result.stdout.strip()
     if not output:
         return None
-    
-    line = output.split('\n')[0]
-    fields = line.split('\t')
-    
-    if len(fields) < 11:
-        return None
-    
-    return BlastHit(
-        query_id=fields[0],
-        subject_id=fields[1],
-        query_start=int(fields[2]),
-        query_end=int(fields[3]),
-        subject_start=int(fields[4]),
-        subject_end=int(fields[5]),
-        query_seq=fields[6],
-        subject_seq=fields[7],
-        evalue=float(fields[8]),
-        bitscore=float(fields[9]),
-        identity=float(fields[10])
-    )
+
+    if max_hsps == 1:
+        line = output.split('\n')[0]
+        fields = line.split('\t')
+
+        if len(fields) < 11:
+            return None
+
+        return BlastHit(
+            query_id=fields[0],
+            subject_id=fields[1],
+            query_start=int(fields[2]),
+            query_end=int(fields[3]),
+            subject_start=int(fields[4]),
+            subject_end=int(fields[5]),
+            query_seq=fields[6],
+            subject_seq=fields[7],
+            evalue=float(fields[8]),
+            bitscore=float(fields[9]),
+            identity=float(fields[10])
+        )
+
+    # Multi-HSP mode: pick the HSP with best query coverage
+    best_hit = None
+    best_coverage = 0.0
+
+    for line in output.split('\n'):
+        if not line:
+            continue
+        fields = line.split('\t')
+        if len(fields) < 11:
+            continue
+
+        hit = BlastHit(
+            query_id=fields[0],
+            subject_id=fields[1],
+            query_start=int(fields[2]),
+            query_end=int(fields[3]),
+            subject_start=int(fields[4]),
+            subject_end=int(fields[5]),
+            query_seq=fields[6],
+            subject_seq=fields[7],
+            evalue=float(fields[8]),
+            bitscore=float(fields[9]),
+            identity=float(fields[10])
+        )
+
+        # Compute query coverage from qlen field if available, else from alignment span
+        if len(fields) >= 13:
+            qlen = int(fields[11])
+            coverage = hit.query_len_aligned / qlen if qlen > 0 else 0.0
+        else:
+            coverage = hit.query_len_aligned  # fallback: prefer longer alignments
+
+        if coverage > best_coverage:
+            best_coverage = coverage
+            best_hit = hit
+
+    return best_hit
 
 
 def _parse_blast_output(output: str) -> List[BlastHit]:
@@ -270,7 +309,7 @@ class BlastRunner:
             '-gapextend', str(gap_extend),
             '-word_size', str(word_size),
             '-evalue', str(evalue),
-            '-outfmt', '6 qseqid sseqid qstart qend sstart send qseq sseq evalue bitscore pident',
+            '-outfmt', '6 qseqid sseqid qstart qend sstart send qseq sseq evalue bitscore pident qlen slen',
             '-max_target_seqs', str(max(n_seqs + 5, 10)),  # Get enough hits
             '-max_hsps', '1',
             '-num_threads', str(threads)
@@ -358,47 +397,170 @@ class BlastRunner:
                          gap_open: int = 11, gap_extend: int = 1,
                          word_size: int = None, evalue: float = 1e-5,
                          verbose: bool = False,
-                         threads: int = None) -> Dict[Tuple[str, str], BlastHit]:
+                         threads: int = None,
+                         coverage_threshold: float = 0.5) -> Dict[Tuple[str, str], BlastHit]:
         """
         Run all pairwise BLASTs between sequences.
-        
+
         Uses database approach: creates DB of all sequences, BLASTs each against it.
         BLAST handles parallelization internally with -num_threads.
-        
+
+        After initial BLAST, checks alignment coverage for each hit. Hits covering
+        less than coverage_threshold of the query are retried with more sensitive
+        parameters (lower word_size, higher e-value, multiple HSPs).
+
         Returns a dictionary mapping (query_id, subject_id) tuples to BlastHit objects.
         """
         if not self._check_blast_installed():
             raise RuntimeError("BLAST+ not found.")
-        
+
         # Set default word size if not specified
         if word_size is None:
             word_size = 3 if self.seq_type == SeqType.PROTEIN else 11
-        
+
         # Determine number of threads
         if threads is None:
             threads = max(1, multiprocessing.cpu_count() - 1)
-        
+
         n_seqs = len(sequences)
         total_pairs = n_seqs * (n_seqs - 1)  # Both directions
-        
+
         if verbose:
             print(f"  Creating BLAST database...")
-        
+
         # Create database of all sequences
         all_db = self.create_database(sequences, db_name='all_seqs_db')
-        
+
         if verbose:
             print(f"  Running all-vs-all BLAST with {threads} threads...")
-        
+
         # BLAST all sequences against the database
         hits = self.run_against_database(
             sequences, all_db, gap_open, gap_extend, word_size, evalue, threads
         )
-        
+
         if verbose:
             print(f"  Found {len(hits)} pairwise alignments")
-        
+
+        # Coverage guard: retry low-coverage hits with more sensitive parameters
+        if coverage_threshold > 0:
+            seq_lens = {s.id: len(s.seq) for s in sequences}
+            hits = self._retry_low_coverage_hits(
+                hits, sequences, seq_lens, word_size, evalue,
+                coverage_threshold, verbose
+            )
+
         return hits
+
+    def _retry_low_coverage_hits(self, hits: Dict[Tuple[str, str], BlastHit],
+                                  sequences: List[Sequence],
+                                  seq_lens: Dict[str, int],
+                                  original_word_size: int,
+                                  original_evalue: float,
+                                  coverage_threshold: float,
+                                  verbose: bool) -> Dict[Tuple[str, str], BlastHit]:
+        """
+        Retry BLAST for pairs where the alignment covers less than the threshold
+        of the query sequence. Uses more sensitive parameters and multiple HSPs.
+        """
+        seq_map = {s.id: s for s in sequences}
+        low_coverage_pairs = set()
+
+        for (qid, sid), hit in hits.items():
+            qlen = seq_lens.get(qid, 0)
+            if qlen == 0:
+                continue
+            coverage = hit.query_len_aligned / qlen
+            if coverage < coverage_threshold:
+                # Track the canonical pair (alphabetically sorted) to avoid duplicates
+                pair = tuple(sorted([qid, sid]))
+                low_coverage_pairs.add(pair)
+
+        if not low_coverage_pairs:
+            return hits
+
+        if verbose:
+            print(f"  Coverage guard: {len(low_coverage_pairs)} pairs below "
+                  f"{coverage_threshold:.0%} coverage, retrying with sensitive parameters...")
+
+        # Sensitive parameters: lower word_size, higher e-value, multiple HSPs
+        sensitive_word_size = max(7, original_word_size - 4) if self.seq_type != SeqType.PROTEIN else max(2, original_word_size - 1)
+        sensitive_evalue = max(original_evalue, 1e-3)
+
+        for id1, id2 in low_coverage_pairs:
+            seq1 = seq_map[id1]
+            seq2 = seq_map[id2]
+
+            # Write temp files for this pair
+            query_path = Path(self.temp_dir) / 'retry_query.fasta'
+            subject_path = Path(self.temp_dir) / 'retry_subject.fasta'
+
+            with open(query_path, 'w') as f:
+                f.write(f">{seq1.id}\n{seq1.seq}\n")
+            with open(subject_path, 'w') as f:
+                f.write(f">{seq2.id}\n{seq2.seq}\n")
+
+            # Try forward with multi-HSP
+            new_fwd = _execute_blast(
+                query_path, subject_path, self.blast_cmd,
+                gap_open=5 if self.seq_type != SeqType.PROTEIN else 11,
+                gap_extend=2 if self.seq_type != SeqType.PROTEIN else 1,
+                word_size=sensitive_word_size,
+                evalue=sensitive_evalue,
+                max_hsps=3
+            )
+            # Try reverse with multi-HSP
+            new_rev = _execute_blast(
+                subject_path, query_path, self.blast_cmd,
+                gap_open=5 if self.seq_type != SeqType.PROTEIN else 11,
+                gap_extend=2 if self.seq_type != SeqType.PROTEIN else 1,
+                word_size=sensitive_word_size,
+                evalue=sensitive_evalue,
+                max_hsps=3
+            )
+
+            # Replace hits if the new ones have better coverage
+            for new_hit, key in [(new_fwd, (id1, id2)), (new_rev, (id2, id1))]:
+                if new_hit is None:
+                    continue
+                qlen = seq_lens.get(new_hit.query_id, 0)
+                new_cov = new_hit.query_len_aligned / qlen if qlen > 0 else 0.0
+
+                old_hit = hits.get(key)
+                if old_hit is None:
+                    hits[key] = new_hit
+                    continue
+
+                old_cov = old_hit.query_len_aligned / seq_lens.get(old_hit.query_id, 1)
+                if new_cov > old_cov:
+                    hits[key] = new_hit
+                    if verbose:
+                        print(f"    {key[0]} vs {key[1]}: coverage {old_cov:.0%} -> {new_cov:.0%}")
+
+        return hits
+
+
+    def run_vs_consensus(self, query: Sequence, consensus_seq: str,
+                          gap_open: int = 5, gap_extend: int = 2,
+                          word_size: int = 7, evalue: float = 1e-3) -> Optional[BlastHit]:
+        """
+        BLAST a single sequence against a consensus string.
+
+        Uses sensitive parameters by default since this is for realigning
+        divergent sequences during iterative refinement.
+        """
+        query_path = Path(self.temp_dir) / 'refine_query.fasta'
+        subject_path = Path(self.temp_dir) / 'refine_consensus.fasta'
+
+        with open(query_path, 'w') as f:
+            f.write(f">{query.id}\n{query.seq}\n")
+        with open(subject_path, 'w') as f:
+            f.write(f">consensus\n{consensus_seq}\n")
+
+        return _execute_blast(
+            query_path, subject_path, self.blast_cmd,
+            gap_open, gap_extend, word_size, evalue, max_hsps=3
+        )
 
 
 def compute_pairwise_scores(hits: Dict[Tuple[str, str], BlastHit],
