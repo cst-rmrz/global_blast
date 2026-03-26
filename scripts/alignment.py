@@ -144,6 +144,160 @@ def create_alignment_no_hit(seq1: Sequence, seq2: Sequence) -> AlignedPair:
     )
 
 
+def needleman_wunsch(seq1: str, seq2: str,
+                     match: int = 2, mismatch: int = -1,
+                     gap: int = -2) -> Tuple[str, str]:
+    """
+    Global pairwise alignment via Needleman-Wunsch dynamic programming.
+
+    Used as a fallback when BLAST coverage is too low to build a reliable
+    alignment — typically for sequences with large insertions relative to
+    the reference, or highly divergent sequences that BLAST's word-seeding
+    misses entirely.
+
+    Returns two aligned strings of equal length (with '-' for gaps).
+    """
+    n, m = len(seq1), len(seq2)
+
+    # Build DP matrix (linear-gap model)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = i * gap
+    for j in range(m + 1):
+        dp[0][j] = j * gap
+
+    for i in range(1, n + 1):
+        row_prev = dp[i - 1]
+        row_curr = dp[i]
+        s1i = seq1[i - 1].upper()
+        for j in range(1, m + 1):
+            diag = row_prev[j - 1] + (match if s1i == seq2[j - 1].upper() else mismatch)
+            up   = row_prev[j] + gap
+            left = row_curr[j - 1] + gap
+            row_curr[j] = diag if diag >= up and diag >= left else (up if up >= left else left)
+
+    # Traceback
+    aligned1: List[str] = []
+    aligned2: List[str] = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0:
+            s1i = seq1[i - 1].upper()
+            diag_score = dp[i - 1][j - 1] + (match if s1i == seq2[j - 1].upper() else mismatch)
+            if dp[i][j] == diag_score:
+                aligned1.append(seq1[i - 1])
+                aligned2.append(seq2[j - 1])
+                i -= 1
+                j -= 1
+                continue
+        if i > 0 and (j == 0 or dp[i][j] == dp[i - 1][j] + gap):
+            aligned1.append(seq1[i - 1])
+            aligned2.append('-')
+            i -= 1
+        else:
+            aligned1.append('-')
+            aligned2.append(seq2[j - 1])
+            j -= 1
+
+    aligned1.reverse()
+    aligned2.reverse()
+    return ''.join(aligned1), ''.join(aligned2)
+
+
+def nw_aligned_pair(seq1: Sequence, seq2: Sequence) -> AlignedPair:
+    """Wrap needleman_wunsch() as an AlignedPair (same interface as extend_pairwise_alignment)."""
+    a1, a2 = needleman_wunsch(seq1.seq, seq2.seq)
+    return AlignedPair(
+        seq1_id=seq1.id, seq2_id=seq2.id,
+        seq1_aligned=a1, seq2_aligned=a2,
+        seq1_original=seq1.seq, seq2_original=seq2.seq
+    )
+
+
+def chain_blast_hsps(hsps: List[BlastHit],
+                     query_seq: str, subject_seq: str) -> AlignedPair:
+    """
+    Chain multiple BLAST HSPs for the same (query, subject) pair into a
+    complete pairwise alignment.
+
+    BLAST reports a single local alignment (HSP) per pair by default. When
+    a sequence has a large insertion relative to the subject (or vice versa),
+    BLAST finds only the matching region and the inserted region appears as a
+    terminal overhang — misplaced into terminal gaps by extend_pairwise_alignment.
+
+    With multiple HSPs, we can recognise those conserved blocks and chain them:
+      [N-terminal extension] [HSP1] [inter-HSP gap fill] [HSP2] ... [C-terminal]
+
+    The inter-HSP regions are filled with gap padding (same as terminal extension):
+    the unaligned residues of each sequence sit opposite gaps in the other.
+    """
+    if not hsps:
+        raise ValueError("chain_blast_hsps called with empty HSP list")
+
+    # Sort by query start position
+    ordered = sorted(hsps, key=lambda h: h.query_start)
+
+    # Remove overlapping HSPs (keep higher bitscore)
+    clean: List[BlastHit] = [ordered[0]]
+    for hsp in ordered[1:]:
+        prev = clean[-1]
+        if hsp.query_start > prev.query_end:
+            clean.append(hsp)
+        elif hsp.bitscore > prev.bitscore:
+            clean[-1] = hsp
+
+    if len(clean) == 1:
+        return extend_pairwise_alignment(clean[0], query_seq, subject_seq)
+
+    # N-terminal region
+    first = clean[0]
+    nq, ns = _extend_terminal(
+        query_seq[:first.query_start - 1],
+        subject_seq[:first.subject_start - 1],
+        is_n_terminal=True
+    )
+    parts_q = [nq]
+    parts_s = [ns]
+
+    for i, hsp in enumerate(clean):
+        # Aligned region from this HSP
+        parts_q.append(hsp.query_seq)
+        parts_s.append(hsp.subject_seq)
+
+        if i + 1 < len(clean):
+            nxt = clean[i + 1]
+            # Inter-HSP unaligned regions
+            inter_q = query_seq[hsp.query_end: nxt.query_start - 1]
+            inter_s = subject_seq[hsp.subject_end: nxt.subject_start - 1]
+            iq, is_ = _extend_terminal(inter_q, inter_s, is_n_terminal=False)
+            parts_q.append(iq)
+            parts_s.append(is_)
+
+    # C-terminal region
+    last = clean[-1]
+    cq, cs = _extend_terminal(
+        query_seq[last.query_end:],
+        subject_seq[last.subject_end:],
+        is_n_terminal=False
+    )
+    parts_q.append(cq)
+    parts_s.append(cs)
+
+    full_q = ''.join(parts_q)
+    full_s = ''.join(parts_s)
+    assert len(full_q) == len(full_s), \
+        f"chain_blast_hsps length mismatch: {len(full_q)} vs {len(full_s)}"
+
+    return AlignedPair(
+        seq1_id=clean[0].query_id,
+        seq2_id=clean[0].subject_id,
+        seq1_aligned=full_q,
+        seq2_aligned=full_s,
+        seq1_original=query_seq,
+        seq2_original=subject_seq
+    )
+
+
 class CenterStarAligner:
     """
     Builds MSA using center-star algorithm.
@@ -161,78 +315,97 @@ class CenterStarAligner:
     
     def build_msa(self, hits: Dict[Tuple[str, str], BlastHit],
                   center_id: Optional[str] = None,
+                  multi_hits: Optional[Dict[Tuple[str, str], List[BlastHit]]] = None,
+                  nw_threshold: float = 0.3,
                   verbose: bool = False) -> Alignment:
         """
         Build MSA from pairwise BLAST hits.
-        
+
         Args:
-            hits: Dictionary of pairwise BLAST results
+            hits: Best single-hit dict for center selection and scoring
             center_id: Optional center sequence ID (auto-detected if None)
+            multi_hits: Optional dict of all HSPs per pair for multi-HSP chaining.
+                        When provided, pairs with multiple HSPs are chained via
+                        chain_blast_hsps() to handle internal insertions correctly.
+            nw_threshold: Coverage fraction below which Needleman-Wunsch global
+                          alignment is used instead of BLAST extension.  Pairs
+                          with no BLAST hit always use NW.  Set to 0 to disable.
             verbose: Print progress information
-        
+
         Returns:
             Alignment object with all sequences aligned
         """
         if len(self.sequences) < 2:
-            # Single sequence - just return it
             seq = list(self.sequences.values())[0]
-            return Alignment(
-                sequences=[seq],
-                seq_type=self.seq_type
-            )
-        
-        # Use provided center or find it
+            return Alignment(sequences=[seq], seq_type=self.seq_type)
+
         if center_id is None:
             center_id = self._find_center(hits)
         self.center_id = center_id
-        
+
         if verbose:
             print(f"  Center sequence: {center_id}")
-        
+
         center_seq = self.sequences[center_id]
         other_ids = [sid for sid in self.seq_ids if sid != center_id]
-        
-        # Get pairwise alignments of all sequences to center
+
         pairwise_alignments = {}
-        
+        nw_count = 0
+
         for other_id in other_ids:
             other_seq = self.sequences[other_id]
-            
-            # Try to find a hit (check both directions)
+            center_len = len(center_seq.seq)
+
+            # --- Multi-HSP chaining path ---
+            if multi_hits is not None:
+                hsps = (multi_hits.get((center_id, other_id)) or
+                        multi_hits.get((other_id, center_id)))
+                if hsps:
+                    # Orient all HSPs with center as query
+                    if hsps[0].query_id != center_id:
+                        hsps = [BlastHit(
+                            query_id=h.subject_id, subject_id=h.query_id,
+                            query_start=h.subject_start, query_end=h.subject_end,
+                            subject_start=h.query_start, subject_end=h.query_end,
+                            query_seq=h.subject_seq, subject_seq=h.query_seq,
+                            evalue=h.evalue, bitscore=h.bitscore, identity=h.identity
+                        ) for h in hsps]
+                    # Check coverage of the best single HSP
+                    best_hsp = max(hsps, key=lambda h: h.bitscore)
+                    cov = best_hsp.query_len_aligned / center_len if center_len else 0.0
+                    if len(hsps) > 1 or cov >= nw_threshold:
+                        pair = chain_blast_hsps(hsps, center_seq.seq, other_seq.seq)
+                        pairwise_alignments[other_id] = pair
+                        continue
+                    # Fall through to NW if single HSP and low coverage
+
+            # --- Single-hit path (original logic) ---
             hit = hits.get((center_id, other_id)) or hits.get((other_id, center_id))
-            
             if hit:
-                # Ensure hit is oriented with center as query
                 if hit.query_id != center_id:
-                    # Swap the hit orientation
                     hit = BlastHit(
-                        query_id=hit.subject_id,
-                        subject_id=hit.query_id,
-                        query_start=hit.subject_start,
-                        query_end=hit.subject_end,
-                        subject_start=hit.query_start,
-                        subject_end=hit.query_end,
-                        query_seq=hit.subject_seq,
-                        subject_seq=hit.query_seq,
-                        evalue=hit.evalue,
-                        bitscore=hit.bitscore,
-                        identity=hit.identity
+                        query_id=hit.subject_id, subject_id=hit.query_id,
+                        query_start=hit.subject_start, query_end=hit.subject_end,
+                        subject_start=hit.query_start, subject_end=hit.query_end,
+                        query_seq=hit.subject_seq, subject_seq=hit.query_seq,
+                        evalue=hit.evalue, bitscore=hit.bitscore, identity=hit.identity
                     )
-                
-                pair = extend_pairwise_alignment(hit, center_seq.seq, other_seq.seq)
-            else:
-                # No hit found - create fallback alignment
-                pair = create_alignment_no_hit(center_seq, other_seq)
-            
+                cov = hit.query_len_aligned / center_len if center_len else 0.0
+                if cov >= nw_threshold:
+                    pair = extend_pairwise_alignment(hit, center_seq.seq, other_seq.seq)
+                    pairwise_alignments[other_id] = pair
+                    continue
+
+            # --- NW fallback: no hit, or coverage below threshold ---
+            nw_count += 1
+            pair = nw_aligned_pair(center_seq, other_seq)
             pairwise_alignments[other_id] = pair
-        
-        # Merge all pairwise alignments
+
+        if verbose and nw_count:
+            print(f"  Used Needleman-Wunsch fallback for {nw_count} low-coverage pairs")
+
         aligned_seqs = self._merge_alignments(center_seq, pairwise_alignments, verbose)
-        
-        return Alignment(
-            sequences=aligned_seqs,
-            seq_type=self.seq_type
-        )
+        return Alignment(sequences=aligned_seqs, seq_type=self.seq_type)
     
     def _find_center(self, hits: Dict[Tuple[str, str], BlastHit]) -> str:
         """Find center sequence with highest total bitscore to others"""
@@ -616,6 +789,348 @@ class CenterStarAligner:
                 result.append('-')
 
         return ''.join(result)
+
+
+def build_upgma_tree(scores: Dict[Tuple[str, str], float],
+                     seq_ids: List[str]) -> List[Tuple[str, str]]:
+    """
+    Build a UPGMA guide tree from pairwise similarity scores.
+
+    Converts bitscores to distances (d = 1 / (1 + score)), then iteratively
+    merges the closest pair using average linkage until one cluster remains.
+
+    Returns a list of (left_id, right_id) merge tuples in merge order
+    (leaves first, root last). Each id is either an original seq_id or a
+    synthetic cluster label like 'cluster_0'.
+    """
+    if len(seq_ids) == 1:
+        return []
+
+    # Convert scores to distances; missing pairs get max distance 1.0
+    dist: Dict[Tuple[str, str], float] = {}
+    for i, id1 in enumerate(seq_ids):
+        for id2 in seq_ids[i + 1:]:
+            score = scores.get((id1, id2), 0.0)
+            dist[(id1, id2)] = 1.0 / (1.0 + score)
+            dist[(id2, id1)] = dist[(id1, id2)]
+
+    # Each cluster maps name -> set of member seq_ids
+    clusters: Dict[str, List[str]] = {sid: [sid] for sid in seq_ids}
+    merges: List[Tuple[str, str]] = []
+    cluster_counter = 0
+
+    while len(clusters) > 1:
+        names = list(clusters.keys())
+
+        # Find closest pair
+        best_pair = None
+        best_dist = float('inf')
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                n1, n2 = names[i], names[j]
+                # Average linkage: mean distance between all member pairs
+                members1 = clusters[n1]
+                members2 = clusters[n2]
+                total = 0.0
+                count = 0
+                for m1 in members1:
+                    for m2 in members2:
+                        key = (m1, m2) if (m1, m2) in dist else (m2, m1)
+                        total += dist.get(key, 1.0)
+                        count += 1
+                avg = total / count if count > 0 else 1.0
+                if avg < best_dist:
+                    best_dist = avg
+                    best_pair = (n1, n2)
+
+        n1, n2 = best_pair
+        merges.append((n1, n2))
+
+        # Create merged cluster
+        new_name = f'cluster_{cluster_counter}'
+        cluster_counter += 1
+        new_members = clusters[n1] + clusters[n2]
+        clusters[new_name] = new_members
+
+        # Update distances from new cluster to all remaining clusters
+        remaining = [k for k in clusters if k not in (n1, n2, new_name)]
+        for other in remaining:
+            other_members = clusters[other]
+            total = 0.0
+            count = 0
+            for m1 in new_members:
+                for m2 in other_members:
+                    key = (m1, m2) if (m1, m2) in dist else (m2, m1)
+                    total += dist.get(key, 1.0)
+                    count += 1
+            avg = total / count if count > 0 else 1.0
+            dist[(new_name, other)] = avg
+            dist[(other, new_name)] = avg
+
+        del clusters[n1]
+        del clusters[n2]
+
+    return merges
+
+
+class ProgressiveAligner:
+    """
+    Builds MSA using progressive alignment with a UPGMA guide tree.
+
+    Algorithm:
+    1. Build distance matrix from BLAST bitscores
+    2. Construct UPGMA guide tree (most-similar pairs merged first)
+    3. Align sequences progressively following the tree using profile-profile
+       merging anchored by the pairwise alignment of cluster representatives
+    """
+
+    def __init__(self, sequences: List[Sequence], seq_type: SeqType):
+        self.sequences = {s.id: s for s in sequences}
+        self.seq_ids = [s.id for s in sequences]
+        self.seq_type = seq_type
+
+    def build_msa(self, hits: Dict[Tuple[str, str], BlastHit],
+                  multi_hits: Optional[Dict[Tuple[str, str], List[BlastHit]]] = None,
+                  nw_threshold: float = 0.3,
+                  verbose: bool = False) -> Alignment:
+        if len(self.sequences) == 1:
+            seq = list(self.sequences.values())[0]
+            return Alignment(sequences=[seq], seq_type=self.seq_type)
+
+        if len(self.sequences) == 2:
+            ids = self.seq_ids
+            seqs = self._align_two(ids[0], ids[1], hits, multi_hits, nw_threshold)
+            return Alignment(sequences=seqs, seq_type=self.seq_type)
+
+        from .blast_runner import compute_pairwise_scores
+        scores = compute_pairwise_scores(hits, self.seq_ids)
+        merges = build_upgma_tree(scores, self.seq_ids)
+
+        if verbose:
+            print(f"  Progressive alignment: {len(merges)} merge steps")
+
+        profiles: Dict[str, List[Sequence]] = {
+            sid: [self.sequences[sid]] for sid in self.seq_ids
+        }
+
+        cluster_counter = 0
+        for left_id, right_id in merges:
+            left_profile = profiles[left_id]
+            right_profile = profiles[right_id]
+
+            left_rep = self._pick_representative(
+                [s.id for s in left_profile], [s.id for s in right_profile], scores
+            )
+            right_rep = self._pick_representative(
+                [s.id for s in right_profile], [s.id for s in left_profile], scores
+            )
+
+            merged = self._merge_profiles(
+                left_profile, right_profile, left_rep, right_rep,
+                hits, multi_hits, nw_threshold
+            )
+
+            new_name = f'cluster_{cluster_counter}'
+            cluster_counter += 1
+            profiles[new_name] = merged
+            del profiles[left_id]
+            del profiles[right_id]
+
+        final_profile = list(profiles.values())[0]
+
+        max_len = max(len(s.seq) for s in final_profile)
+        result = [
+            Sequence(id=s.id, description=s.description,
+                     seq=s.seq + '-' * (max_len - len(s.seq)))
+            for s in final_profile
+        ]
+        return Alignment(sequences=result, seq_type=self.seq_type)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _align_two(self, id1: str, id2: str,
+                   hits: Dict[Tuple[str, str], BlastHit],
+                   multi_hits: Optional[Dict[Tuple[str, str], List[BlastHit]]] = None,
+                   nw_threshold: float = 0.3) -> List[Sequence]:
+        """Align two raw sequences; prefer multi-HSP chaining, fall back to NW."""
+        seq1, seq2 = self.sequences[id1], self.sequences[id2]
+        pair = self._best_pair(id1, id2, seq1, seq2, hits, multi_hits, nw_threshold)
+        return [
+            Sequence(id=id1, description=seq1.description, seq=pair.seq1_aligned),
+            Sequence(id=id2, description=seq2.description, seq=pair.seq2_aligned),
+        ]
+
+    def _flip_hit(self, hit: BlastHit) -> BlastHit:
+        """Return a copy of hit with query and subject swapped."""
+        return BlastHit(
+            query_id=hit.subject_id, subject_id=hit.query_id,
+            query_start=hit.subject_start, query_end=hit.subject_end,
+            subject_start=hit.query_start, subject_end=hit.query_end,
+            query_seq=hit.subject_seq, subject_seq=hit.query_seq,
+            evalue=hit.evalue, bitscore=hit.bitscore, identity=hit.identity,
+        )
+
+    def _best_pair(self, id1: str, id2: str,
+                   seq1: Sequence, seq2: Sequence,
+                   hits: Dict[Tuple[str, str], BlastHit],
+                   multi_hits: Optional[Dict[Tuple[str, str], List[BlastHit]]],
+                   nw_threshold: float) -> AlignedPair:
+        """
+        Return the best AlignedPair for (id1, id2):
+          1. Multi-HSP chaining if multiple HSPs exist
+          2. Single-hit extension if coverage >= threshold
+          3. Needleman-Wunsch global alignment otherwise
+        """
+        q_len = len(seq1.seq)
+
+        # Multi-HSP path
+        if multi_hits is not None:
+            hsps = multi_hits.get((id1, id2)) or multi_hits.get((id2, id1))
+            if hsps:
+                if hsps[0].query_id != id1:
+                    hsps = [self._flip_hit(h) for h in hsps]
+                best = max(hsps, key=lambda h: h.bitscore)
+                cov = best.query_len_aligned / q_len if q_len else 0.0
+                if len(hsps) > 1 or cov >= nw_threshold:
+                    return chain_blast_hsps(hsps, seq1.seq, seq2.seq)
+
+        # Single-hit path
+        hit = hits.get((id1, id2)) or hits.get((id2, id1))
+        if hit:
+            if hit.query_id != id1:
+                hit = self._flip_hit(hit)
+            cov = hit.query_len_aligned / q_len if q_len else 0.0
+            if cov >= nw_threshold:
+                return extend_pairwise_alignment(hit, seq1.seq, seq2.seq)
+
+        # NW fallback
+        return nw_aligned_pair(seq1, seq2)
+
+    def _pick_representative(self, own_ids: List[str], other_ids: List[str],
+                              scores: Dict[Tuple[str, str], float]) -> str:
+        """Member of own_ids with highest total bitscore to other_ids."""
+        best_id = own_ids[0]
+        best_score = -1.0
+        for oid in own_ids:
+            total = sum(scores.get((oid, o), 0.0) for o in other_ids)
+            if total > best_score:
+                best_score = total
+                best_id = oid
+        return best_id
+
+    def _merge_profiles(self, left_profile: List[Sequence],
+                        right_profile: List[Sequence],
+                        left_rep: str, right_rep: str,
+                        hits: Dict[Tuple[str, str], BlastHit],
+                        multi_hits: Optional[Dict[Tuple[str, str], List[BlastHit]]] = None,
+                        nw_threshold: float = 0.3) -> List[Sequence]:
+        """
+        Merge two profiles by aligning their representatives.
+
+        Core idea: the pairwise alignment of (left_rep_raw, right_rep_raw) gives
+        us a column correspondence between raw residue positions. We map raw
+        positions back to current profile columns via the representatives'
+        profile sequences, then build the merged column list.
+
+        Profile columns come in two kinds for each representative:
+          - residue columns: the rep has a non-gap character there
+          - insertion columns: the rep has '-' there (introduced by a prior merge)
+
+        Insertion columns travel with the adjacent residue column.
+        """
+        left_seq  = self.sequences[left_rep]
+        right_seq = self.sequences[right_rep]
+
+        pair = self._best_pair(left_rep, right_rep, left_seq, right_seq,
+                               hits, multi_hits, nw_threshold)
+        left_aln  = pair.seq1_aligned
+        right_aln = pair.seq2_aligned
+
+        # Build column groups for each profile.
+        # A "group" is (list_of_preceding_insertion_cols, residue_col_index).
+        # We also track trailing insertion columns after the last residue.
+        left_groups,  left_trailing  = self._col_groups(left_profile,  left_rep)
+        right_groups, right_trailing = self._col_groups(right_profile, right_rep)
+
+        # Walk the pairwise alignment, interleaving column groups.
+        # Each alignment position consumes one left group, one right group, or both.
+        merged: List[Tuple[Optional[int], Optional[int]]] = []
+        # Each entry is (left_col_or_None, right_col_or_None)
+
+        left_g  = 0
+        right_g = 0
+
+        for l_ch, r_ch in zip(left_aln, right_aln):
+            if l_ch != '-' and r_ch != '-':
+                l_ins, l_res = left_groups[left_g]
+                r_ins, r_res = right_groups[right_g]
+                for ic in l_ins:
+                    merged.append((ic, None))
+                for ic in r_ins:
+                    merged.append((None, ic))
+                merged.append((l_res, r_res))
+                left_g  += 1
+                right_g += 1
+            elif l_ch != '-':
+                l_ins, l_res = left_groups[left_g]
+                for ic in l_ins:
+                    merged.append((ic, None))
+                merged.append((l_res, None))
+                left_g += 1
+            else:
+                r_ins, r_res = right_groups[right_g]
+                for ic in r_ins:
+                    merged.append((None, ic))
+                merged.append((None, r_res))
+                right_g += 1
+
+        # Trailing insertion columns
+        for ic in left_trailing:
+            merged.append((ic, None))
+        for ic in right_trailing:
+            merged.append((None, ic))
+
+        # Build output sequences by selecting columns from each profile
+        left_cols  = {s.id: list(s.seq) for s in left_profile}
+        right_cols = {s.id: list(s.seq) for s in right_profile}
+
+        result = []
+        for seq_obj in left_profile:
+            chars = [left_cols[seq_obj.id][lc] if lc is not None else '-'
+                     for lc, _ in merged]
+            result.append(Sequence(id=seq_obj.id, description=seq_obj.description,
+                                   seq=''.join(chars)))
+        for seq_obj in right_profile:
+            chars = [right_cols[seq_obj.id][rc] if rc is not None else '-'
+                     for _, rc in merged]
+            result.append(Sequence(id=seq_obj.id, description=seq_obj.description,
+                                   seq=''.join(chars)))
+        return result
+
+    def _col_groups(self, profile: List[Sequence],
+                    rep_id: str) -> Tuple[List[Tuple[List[int], int]], List[int]]:
+        """
+        For a profile, group its columns relative to the representative sequence.
+
+        Returns:
+          groups: list of (insertion_col_indices_before, residue_col_index)
+                  one entry per non-gap character in the representative
+          trailing: list of insertion column indices after the last residue
+        """
+        rep_seq = next(s.seq for s in profile if s.id == rep_id)
+        groups: List[Tuple[List[int], int]] = []
+        pending_insertions: List[int] = []
+
+        for col, ch in enumerate(rep_seq):
+            if ch == '-':
+                pending_insertions.append(col)
+            else:
+                groups.append((pending_insertions, col))
+                pending_insertions = []
+
+        return groups, pending_insertions
 
 
 def compute_hit_coverage(hit: BlastHit, query_len: int, subject_len: int) -> float:

@@ -6,7 +6,7 @@ from .blast_runner import (
     BlastRunner, BlastHit, compute_pairwise_scores, find_center_sequence,
 )
 from .alignment import (
-    CenterStarAligner, AlignedPair, extend_pairwise_alignment,
+    CenterStarAligner, ProgressiveAligner, AlignedPair, extend_pairwise_alignment,
     compute_msa_score, compute_percent_identity, compute_column_score,
     compute_per_sequence_identity, compute_hit_coverage, build_consensus,
 )

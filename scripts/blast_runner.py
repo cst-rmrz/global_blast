@@ -495,6 +495,79 @@ class BlastRunner:
 
         return hits
 
+    def run_all_pairwise_multi_hsp(self, sequences: List[Sequence],
+                                    gap_open: int = 11, gap_extend: int = 1,
+                                    word_size: int = None, evalue: float = 1e-5,
+                                    verbose: bool = False,
+                                    threads: int = None,
+                                    max_hsps: int = 10) -> Dict[Tuple[str, str], List[BlastHit]]:
+        """
+        Like run_all_pairwise() but returns ALL HSPs per (query, subject) pair.
+
+        Multi-HSP mode is important for sequences that have large insertions
+        relative to other sequences: BLAST finds multiple conserved blocks as
+        separate HSPs. chain_blast_hsps() can then chain them into a complete
+        alignment that correctly places the insertion.
+
+        Returns: Dict mapping (query_id, subject_id) -> List[BlastHit] sorted
+                 by query_start position.  Pairs with no hit are absent.
+        """
+        if not self._check_blast_installed():
+            raise RuntimeError("BLAST+ not found.")
+
+        if word_size is None:
+            word_size = 3 if self.seq_type == SeqType.PROTEIN else 11
+        if threads is None:
+            threads = max(1, multiprocessing.cpu_count() - 1)
+
+        if verbose:
+            print(f"  Creating BLAST database (multi-HSP mode, max_hsps={max_hsps})...")
+
+        all_db = self.create_database(sequences, db_name='all_seqs_db_mhsp')
+
+        query_path = Path(self.temp_dir) / 'queries_mhsp.fasta'
+        with open(query_path, 'w') as f:
+            for seq in sequences:
+                f.write(f">{seq.id}\n{seq.seq}\n")
+
+        n_seqs = len(sequences)
+        cmd = [
+            self.blast_cmd,
+            '-query', str(query_path),
+            '-db', str(all_db),
+            '-gapopen', str(gap_open),
+            '-gapextend', str(gap_extend),
+            '-word_size', str(word_size),
+            '-evalue', str(evalue),
+            '-outfmt', '6 qseqid sseqid qstart qend sstart send qseq sseq evalue bitscore pident qlen slen',
+            '-max_target_seqs', str(max(n_seqs + 5, 10)),
+            '-max_hsps', str(max_hsps),
+            '-num_threads', str(threads)
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0 and 'error' in result.stderr.lower():
+            raise RuntimeError(f"BLAST failed: {result.stderr}")
+
+        # Collect ALL HSPs per pair
+        multi_hits: Dict[Tuple[str, str], List[BlastHit]] = {}
+        for hit in _parse_blast_output(result.stdout):
+            if hit.query_id == hit.subject_id:
+                continue
+            key = (hit.query_id, hit.subject_id)
+            multi_hits.setdefault(key, []).append(hit)
+
+        # Sort each list by query_start
+        for key in multi_hits:
+            multi_hits[key].sort(key=lambda h: h.query_start)
+
+        if verbose:
+            n_pairs = len(multi_hits)
+            n_multi = sum(1 for v in multi_hits.values() if len(v) > 1)
+            print(f"  Found {n_pairs} pairwise alignments ({n_multi} with multiple HSPs)")
+
+        return multi_hits
+
     def _retry_low_coverage_hits(self, hits: Dict[Tuple[str, str], BlastHit],
                                   sequences: List[Sequence],
                                   seq_lens: Dict[str, int],

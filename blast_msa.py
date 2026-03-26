@@ -30,6 +30,7 @@ from scripts import (
     SeqType,
     BlastRunner,
     CenterStarAligner,
+    ProgressiveAligner,
     ParameterOptimizer,
     parse_param_list,
     parse_param_range,
@@ -154,7 +155,12 @@ Output formats:
                        help='Word size for BLAST seeding')
     parser.add_argument('--evalue', type=float, default=None,
                        help='E-value threshold')
-    
+    parser.add_argument('--method', choices=['center-star', 'progressive'],
+                       default='center-star',
+                       help='MSA algorithm: center-star (default) or progressive '
+                            '(UPGMA guide tree). Note: --optimize always uses '
+                            'center-star internally for parameter tuning.')
+
     # Optimization
     parser.add_argument('--optimize', action='store_true',
                        help='Optimize parameters through grid search')
@@ -169,6 +175,11 @@ Output formats:
                        help='Maximum refinement iterations (default: 3)')
     parser.add_argument('--coverage-threshold', type=float, default=None,
                        help='Minimum alignment coverage to accept a BLAST hit (default: 0.5)')
+    parser.add_argument('--nw-threshold', type=float, default=None,
+                       help='BLAST coverage below which Needleman-Wunsch global alignment '
+                            'is used instead of local BLAST extension. Helps sequences '
+                            'with internal insertions that BLAST finds only partially. '
+                            'Set to 0 to disable NW fallback (default: 0.3)')
     
     # Output options
     parser.add_argument('-v', '--verbose', action='store_true',
@@ -241,16 +252,19 @@ Output formats:
 
     coverage_threshold = (args.coverage_threshold if args.coverage_threshold is not None
                          else params['coverage_threshold'])
+    nw_threshold = args.nw_threshold if args.nw_threshold is not None else 0.3
     refine = args.refine or params['refine']
     refine_iterations = (args.refine_iterations if args.refine_iterations is not None
                         else params['refine_iterations'])
+
+    aligner_class = ProgressiveAligner if args.method == 'progressive' else CenterStarAligner
 
     # Run alignment
     if args.optimize:
         if args.verbose:
             print("Running parameter optimization...")
             print()
-        
+
         # Get optimization parameters (sequence-type specific) - now ranges
         if is_protein:
             opt_gap_open = params['optimize_gap_open_protein']
@@ -260,9 +274,9 @@ Output formats:
             opt_gap_open = params['optimize_gap_open_nucleotide']
             opt_gap_extend = params['optimize_gap_extend_nucleotide']
             opt_word_size = params['optimize_word_size_nucleotide']
-        
+
         metric = args.metric if args.metric else params['optimize_metric']
-        
+
         optimizer = ParameterOptimizer(sequences, seq_type)
         result = optimizer.optimize(
             gap_open_range=opt_gap_open,
@@ -271,18 +285,19 @@ Output formats:
             evalue=evalue,
             metric=metric,
             verbose=args.verbose,
-            threads=args.threads
+            threads=args.threads,
+            aligner_class=aligner_class
         )
-        
+
         alignment = result.best_alignment
-        
+
         if args.verbose:
             print()
             print("Optimization complete!")
             print(f"  Best parameters: {result.best_params}")
             print(f"  Best {metric}: {result.best_score:.2f}")
             print()
-    
+
     else:
         if args.verbose:
             print("Running BLAST alignments...")
@@ -290,8 +305,9 @@ Output formats:
             print(f"  Gap extend: {gap_extend}")
             print(f"  Word size: {word_size}")
             print()
-        
+
         with BlastRunner(seq_type) as runner:
+            # Single-hit dict for center/representative selection
             hits = runner.run_all_pairwise(
                 sequences,
                 gap_open=gap_open,
@@ -302,14 +318,31 @@ Output formats:
                 threads=args.threads,
                 coverage_threshold=coverage_threshold
             )
-        
+            # Multi-HSP dict for chaining (handles internal insertions)
+            if nw_threshold > 0:
+                multi_hits = runner.run_all_pairwise_multi_hsp(
+                    sequences,
+                    gap_open=gap_open,
+                    gap_extend=gap_extend,
+                    word_size=word_size,
+                    evalue=evalue,
+                    verbose=args.verbose,
+                    threads=args.threads
+                )
+            else:
+                multi_hits = None
+
         if args.verbose:
-            print(f"  Found {len(hits)} pairwise alignments")
             print()
             print("Building MSA...")
-        
-        aligner = CenterStarAligner(sequences, seq_type)
-        alignment = aligner.build_msa(hits, verbose=args.verbose)
+
+        aligner = aligner_class(sequences, seq_type)
+        alignment = aligner.build_msa(
+            hits,
+            multi_hits=multi_hits,
+            nw_threshold=nw_threshold,
+            verbose=args.verbose
+        )
         alignment.parameters = {
             'gap_open': gap_open,
             'gap_extend': gap_extend,

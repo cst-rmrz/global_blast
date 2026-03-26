@@ -293,7 +293,8 @@ class ParameterOptimizer:
                  evalue: float = 1e-5,
                  metric: str = 'sp_score',
                  verbose: bool = False,
-                 threads: int = None) -> OptimizationResult:
+                 threads: int = None,
+                 aligner_class=None) -> OptimizationResult:
         """
         Run efficient parameter optimization.
         
@@ -464,7 +465,9 @@ class ParameterOptimizer:
                 threads=threads
             )
         
-        aligner = CenterStarAligner(self.sequences, self.seq_type)
+        if aligner_class is None:
+            aligner_class = CenterStarAligner
+        aligner = aligner_class(self.sequences, self.seq_type)
         alignment = aligner.build_msa(hits, verbose=verbose)
         alignment.parameters = best_params.copy()
         
