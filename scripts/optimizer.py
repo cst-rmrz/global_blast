@@ -310,7 +310,9 @@ class ParameterOptimizer:
                  metric: str = 'sp_score',
                  verbose: bool = False,
                  threads: int = None,
-                 coverage_threshold: float = 0.5) -> OptimizationResult:
+                 coverage_threshold: float = 0.5,
+                 synteny: bool = False,
+                 max_hsps: int = 10) -> OptimizationResult:
         """
         Run efficient univariate parameter optimization.
 
@@ -493,21 +495,35 @@ class ParameterOptimizer:
             print("Building final MSA with optimal parameters...")
 
         with BlastRunner(self.seq_type) as runner:
-            hits = runner.run_all_pairwise(
-                self.sequences,
-                gap_open=best_params['gap_open'],
-                gap_extend=best_params['gap_extend'],
-                word_size=best_params['word_size'],
-                evalue=evalue,
-                verbose=verbose,
-                threads=threads,
-                coverage_threshold=coverage_threshold,
-                reward=best_params.get('reward'),
-                penalty=best_params.get('penalty')
-            )
+            if synteny:
+                multi_hits = runner.run_all_pairwise_multi_hsp(
+                    self.sequences,
+                    gap_open=best_params['gap_open'],
+                    gap_extend=best_params['gap_extend'],
+                    word_size=best_params['word_size'],
+                    evalue=evalue,
+                    verbose=verbose,
+                    threads=threads,
+                    max_hsps=max_hsps
+                )
+                hits = {k: max(v, key=lambda h: h.bitscore) for k, v in multi_hits.items()}
+            else:
+                hits = runner.run_all_pairwise(
+                    self.sequences,
+                    gap_open=best_params['gap_open'],
+                    gap_extend=best_params['gap_extend'],
+                    word_size=best_params['word_size'],
+                    evalue=evalue,
+                    verbose=verbose,
+                    threads=threads,
+                    coverage_threshold=coverage_threshold,
+                    reward=best_params.get('reward'),
+                    penalty=best_params.get('penalty')
+                )
+                multi_hits = None
 
         aligner = CenterStarAligner(self.sequences, self.seq_type)
-        alignment = aligner.build_msa(hits, verbose=verbose)
+        alignment = aligner.build_msa(hits, multi_hits=multi_hits, verbose=verbose)
         alignment.parameters = best_params.copy()
 
         final_score = scoring_fn(alignment)

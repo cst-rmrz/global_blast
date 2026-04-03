@@ -282,7 +282,9 @@ Output formats:
             metric=metric,
             verbose=args.verbose,
             threads=args.threads,
-            coverage_threshold=coverage_threshold
+            coverage_threshold=coverage_threshold,
+            synteny=args.synteny,
+            max_hsps=args.max_hsps
         )
         
         alignment = result.best_alignment
