@@ -95,7 +95,9 @@ def _run_single_blast(args: Tuple) -> Tuple[Tuple[str, str], Optional[BlastHit],
 def _execute_blast(query_path: Path, subject_path: Path, blast_cmd: str,
                    gap_open: int, gap_extend: int, word_size: int,
                    evalue: float, max_hsps: int = 1,
-                   distant: bool = False) -> Optional[BlastHit]:
+                   distant: bool = False,
+                   reward: Optional[int] = None,
+                   penalty: Optional[int] = None) -> Optional[BlastHit]:
     """Execute a single BLAST command and parse result."""
     cmd = [
         blast_cmd,
@@ -109,11 +111,16 @@ def _execute_blast(query_path: Path, subject_path: Path, blast_cmd: str,
         '-max_target_seqs', '1',
         '-max_hsps', str(max_hsps)
     ]
-    if distant:
-        if blast_cmd == 'blastn':
-            cmd += ['-reward', '1', '-penalty', '-2', '-dust', 'no']
-        else:
-            cmd += ['-seg', 'no']
+    if blast_cmd == 'blastn':
+        # Explicit reward/penalty take precedence over distant defaults
+        r = reward if reward is not None else (1 if distant else None)
+        p = penalty if penalty is not None else (-2 if distant else None)
+        if r is not None and p is not None:
+            cmd += ['-reward', str(r), '-penalty', str(p)]
+        if distant:
+            cmd += ['-dust', 'no']
+    elif distant:
+        cmd += ['-seg', 'no']
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -327,7 +334,9 @@ class BlastRunner:
     def run_against_database(self, queries: List[Sequence], db_path: Path,
                               gap_open: int, gap_extend: int, word_size: int,
                               evalue: float, threads: int = 1,
-                              distant: bool = False) -> Dict[Tuple[str, str], BlastHit]:
+                              distant: bool = False,
+                              reward: Optional[int] = None,
+                              penalty: Optional[int] = None) -> Dict[Tuple[str, str], BlastHit]:
         """
         Run all query sequences against a BLAST database in a single call.
         
@@ -364,11 +373,15 @@ class BlastRunner:
             '-max_hsps', '1',
             '-num_threads', str(threads)
         ]
-        if distant:
-            if self.blast_cmd == 'blastn':
-                cmd += ['-reward', '1', '-penalty', '-2', '-dust', 'no']
-            else:
-                cmd += ['-seg', 'no']
+        if self.blast_cmd == 'blastn':
+            r = reward if reward is not None else (1 if distant else None)
+            p = penalty if penalty is not None else (-2 if distant else None)
+            if r is not None and p is not None:
+                cmd += ['-reward', str(r), '-penalty', str(p)]
+            if distant:
+                cmd += ['-dust', 'no']
+        elif distant:
+            cmd += ['-seg', 'no']
         
         result = subprocess.run(cmd, capture_output=True, text=True)
         
@@ -391,7 +404,9 @@ class BlastRunner:
     
     def run_reference_vs_others(self, reference: Sequence, others: List[Sequence],
                                  gap_open: int, gap_extend: int, word_size: int,
-                                 evalue: float, threads: int = None) -> Dict[Tuple[str, str], BlastHit]:
+                                 evalue: float, threads: int = None,
+                                 reward: Optional[int] = None,
+                                 penalty: Optional[int] = None) -> Dict[Tuple[str, str], BlastHit]:
         """
         Efficiently align a reference sequence against all others.
         
@@ -408,14 +423,16 @@ class BlastRunner:
         # Forward: others query against reference DB
         ref_db = self.create_database([reference], db_name='ref_db')
         forward_hits = self.run_against_database(
-            others, ref_db, gap_open, gap_extend, word_size, evalue, threads
+            others, ref_db, gap_open, gap_extend, word_size, evalue, threads,
+            reward=reward, penalty=penalty
         )
         hits.update(forward_hits)
-        
+
         # Reverse: reference query against others DB
         others_db = self.create_database(others, db_name='others_db')
         reverse_hits = self.run_against_database(
-            [reference], others_db, gap_open, gap_extend, word_size, evalue, threads
+            [reference], others_db, gap_open, gap_extend, word_size, evalue, threads,
+            reward=reward, penalty=penalty
         )
         hits.update(reverse_hits)
         
@@ -454,7 +471,9 @@ class BlastRunner:
                          verbose: bool = False,
                          threads: int = None,
                          coverage_threshold: float = 0.5,
-                         distant: bool = False) -> Dict[Tuple[str, str], BlastHit]:
+                         distant: bool = False,
+                         reward: Optional[int] = None,
+                         penalty: Optional[int] = None) -> Dict[Tuple[str, str], BlastHit]:
         """
         Run all pairwise BLASTs between sequences.
 
@@ -493,7 +512,7 @@ class BlastRunner:
         # BLAST all sequences against the database
         hits = self.run_against_database(
             sequences, all_db, gap_open, gap_extend, word_size, evalue, threads,
-            distant=distant
+            distant=distant, reward=reward, penalty=penalty
         )
 
         if verbose:
