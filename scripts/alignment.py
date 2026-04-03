@@ -686,35 +686,50 @@ class CenterStarAligner:
                         if sid in self.sequences]
 
             if nw_subgroup:
-                # Build all pairwise NW alignments directly — no BLAST needed
-                sub_hits = {}
+                # Compute all pairwise NW alignments, store by (id1, id2)
+                nw_pairs = {}
                 for i, s1 in enumerate(sub_seqs):
                     for s2 in sub_seqs[i + 1:]:
-                        pair = nw_aligned_pair(s1, s2)
-                        # Store as a synthetic BlastHit covering the full sequences
-                        hit_fwd = BlastHit(
-                            query_id=s1.id, subject_id=s2.id,
-                            query_start=1, query_end=len(s1.seq),
-                            subject_start=1, subject_end=len(s2.seq),
-                            query_seq=pair.seq1_aligned.replace('-', ''),
-                            subject_seq=pair.seq2_aligned.replace('-', ''),
-                            evalue=0.0, bitscore=1.0,
-                            identity=sum(a == b for a, b in zip(
-                                pair.seq1_aligned, pair.seq2_aligned)
-                                if a != '-' and b != '-') /
-                                max(1, sum(a != '-' or b != '-' for a, b in zip(
-                                    pair.seq1_aligned, pair.seq2_aligned))) * 100
+                        nw_pairs[(s1.id, s2.id)] = nw_aligned_pair(s1, s2)
+
+                # Find center: sequence with highest total pairwise identity
+                identity_sums = {s.id: 0.0 for s in sub_seqs}
+                for (id1, id2), pair in nw_pairs.items():
+                    matches = sum(a == b for a, b in zip(pair.seq1_aligned,
+                                                          pair.seq2_aligned)
+                                  if a != '-' and b != '-')
+                    aligned = sum(1 for a, b in zip(pair.seq1_aligned,
+                                                     pair.seq2_aligned)
+                                  if a != '-' or b != '-')
+                    pct = matches / max(1, aligned) * 100
+                    identity_sums[id1] += pct
+                    identity_sums[id2] += pct
+
+                center_id = max(identity_sums, key=lambda x: identity_sums[x])
+                center_seq = self.sequences[center_id]
+
+                # Build pairwise alignments vs center, oriented center-as-seq1
+                pairwise = {}
+                for s in sub_seqs:
+                    if s.id == center_id:
+                        continue
+                    pair = nw_pairs.get((center_id, s.id)) or \
+                           nw_pairs.get((s.id, center_id))
+                    if pair and pair.seq1_id != center_id:
+                        pair = AlignedPair(
+                            seq1_id=pair.seq2_id, seq2_id=pair.seq1_id,
+                            seq1_aligned=pair.seq2_aligned,
+                            seq2_aligned=pair.seq1_aligned,
+                            seq1_original=pair.seq2_original,
+                            seq2_original=pair.seq1_original
                         )
-                        sub_hits[(s1.id, s2.id)] = hit_fwd
-                        sub_hits[(s2.id, s1.id)] = BlastHit(
-                            query_id=s2.id, subject_id=s1.id,
-                            query_start=1, query_end=len(s2.seq),
-                            subject_start=1, subject_end=len(s1.seq),
-                            query_seq=pair.seq2_aligned.replace('-', ''),
-                            subject_seq=pair.seq1_aligned.replace('-', ''),
-                            evalue=0.0, bitscore=1.0,
-                            identity=hit_fwd.identity
-                        )
+                    if pair:
+                        pairwise[s.id] = pair
+
+                sub_aligner = CenterStarAligner(sub_seqs, self.seq_type)
+                sub_aligner.center_id = center_id
+                aligned_seqs = sub_aligner._merge_alignments(center_seq, pairwise)
+                sub_msa = Alignment(sequences=aligned_seqs, seq_type=self.seq_type)
             else:
                 with BlastRunner(self.seq_type) as runner:
                     sub_hits = runner.run_all_pairwise(
@@ -727,10 +742,8 @@ class CenterStarAligner:
                         coverage_threshold=coverage_threshold,
                         max_hsps=max_hsps
                     )
-
-            # Build sub-MSA with auto-selected center
-            sub_aligner = CenterStarAligner(sub_seqs, self.seq_type)
-            sub_msa = sub_aligner.build_msa(sub_hits, nw_terminals=nw_terminals)
+                sub_aligner = CenterStarAligner(sub_seqs, self.seq_type)
+                sub_msa = sub_aligner.build_msa(sub_hits, nw_terminals=nw_terminals)
 
             sub_scores = compute_per_sequence_identity(sub_msa)
             still_poor = {sid for sid, s in sub_scores.items()
@@ -754,8 +767,30 @@ class CenterStarAligner:
 
                 for candidate_id in sorted(current_poor):
                     cand_aligner = CenterStarAligner(sub_seqs, self.seq_type)
-                    cand_msa = cand_aligner.build_msa(sub_hits, center_id=candidate_id,
-                                                        nw_terminals=nw_terminals)
+                    if nw_subgroup:
+                        cand_center_seq = self.sequences[candidate_id]
+                        cand_pairwise = {}
+                        for s in sub_seqs:
+                            if s.id == candidate_id:
+                                continue
+                            pair = nw_pairs.get((candidate_id, s.id)) or \
+                                   nw_pairs.get((s.id, candidate_id))
+                            if pair and pair.seq1_id != candidate_id:
+                                pair = AlignedPair(
+                                    seq1_id=pair.seq2_id, seq2_id=pair.seq1_id,
+                                    seq1_aligned=pair.seq2_aligned,
+                                    seq2_aligned=pair.seq1_aligned,
+                                    seq1_original=pair.seq2_original,
+                                    seq2_original=pair.seq1_original
+                                )
+                            if pair:
+                                cand_pairwise[s.id] = pair
+                        cand_aligner.center_id = candidate_id
+                        cand_seqs = cand_aligner._merge_alignments(cand_center_seq, cand_pairwise)
+                        cand_msa = Alignment(sequences=cand_seqs, seq_type=self.seq_type)
+                    else:
+                        cand_msa = cand_aligner.build_msa(sub_hits, center_id=candidate_id,
+                                                            nw_terminals=nw_terminals)
                     cand_scores = compute_per_sequence_identity(cand_msa)
                     cand_still_poor = {sid for sid, s in cand_scores.items()
                                        if s < identity_threshold}
