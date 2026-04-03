@@ -13,6 +13,159 @@ from .sequence_io import Sequence, Alignment, SeqType
 from .blast_runner import BlastHit, BlastRunner
 
 
+def needleman_wunsch(seq1: str, seq2: str,
+                     match: int = 2, mismatch: int = -1,
+                     gap: int = -2) -> Tuple[str, str]:
+    """
+    Global pairwise alignment via Needleman-Wunsch dynamic programming.
+
+    Used for inter-anchor segments in synteny-aware MSA: aligns the unmatched
+    regions between BLAST HSP anchors rather than gap-padding them.
+
+    Returns two aligned strings of equal length (with '-' for gaps).
+    """
+    n, m = len(seq1), len(seq2)
+
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = i * gap
+    for j in range(m + 1):
+        dp[0][j] = j * gap
+
+    for i in range(1, n + 1):
+        row_prev = dp[i - 1]
+        row_curr = dp[i]
+        s1i = seq1[i - 1].upper()
+        for j in range(1, m + 1):
+            diag = row_prev[j - 1] + (match if s1i == seq2[j - 1].upper() else mismatch)
+            up   = row_prev[j] + gap
+            left = row_curr[j - 1] + gap
+            row_curr[j] = diag if diag >= up and diag >= left else (up if up >= left else left)
+
+    aligned1: List[str] = []
+    aligned2: List[str] = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0:
+            s1i = seq1[i - 1].upper()
+            diag_score = dp[i - 1][j - 1] + (match if s1i == seq2[j - 1].upper() else mismatch)
+            if dp[i][j] == diag_score:
+                aligned1.append(seq1[i - 1])
+                aligned2.append(seq2[j - 1])
+                i -= 1
+                j -= 1
+                continue
+        if i > 0 and (j == 0 or dp[i][j] == dp[i - 1][j] + gap):
+            aligned1.append(seq1[i - 1])
+            aligned2.append('-')
+            i -= 1
+        else:
+            aligned1.append('-')
+            aligned2.append(seq2[j - 1])
+            j -= 1
+
+    aligned1.reverse()
+    aligned2.reverse()
+    return ''.join(aligned1), ''.join(aligned2)
+
+
+def chain_blast_hsps(hsps: List[BlastHit],
+                     query_seq: str, subject_seq: str) -> 'AlignedPair':
+    """
+    Chain multiple BLAST HSPs for the same (query, subject) pair into a
+    complete pairwise alignment.
+
+    Each HSP is treated as a positional anchor: its columns are locked to the
+    reference frame. Inter-anchor segments are aligned via Needleman-Wunsch
+    rather than gap-padded, preserving homology in divergent insert regions.
+    Terminal overhangs are gap-padded as usual.
+
+    HSP deduplication: query-overlapping HSPs are resolved by keeping the
+    higher bitscore; subject-overlapping HSPs are handled the same way.
+    """
+    if not hsps:
+        raise ValueError("chain_blast_hsps called with empty HSP list")
+
+    if len(hsps) == 1:
+        return extend_pairwise_alignment(hsps[0], query_seq, subject_seq)
+
+    # Sort by query start
+    ordered = sorted(hsps, key=lambda h: h.query_start)
+
+    # Remove query-overlapping HSPs (keep higher bitscore)
+    clean: List[BlastHit] = [ordered[0]]
+    for hsp in ordered[1:]:
+        prev = clean[-1]
+        if hsp.query_start > prev.query_end:
+            clean.append(hsp)
+        elif hsp.bitscore > prev.bitscore:
+            clean[-1] = hsp
+
+    # Remove subject-overlapping HSPs (subject coords may not be monotone
+    # after query-order sorting, which would double-count subject residues)
+    subject_clean: List[BlastHit] = [clean[0]]
+    for hsp in clean[1:]:
+        if hsp.subject_start > subject_clean[-1].subject_end:
+            subject_clean.append(hsp)
+        elif hsp.bitscore > subject_clean[-1].bitscore:
+            subject_clean[-1] = hsp
+    clean = subject_clean
+
+    if len(clean) == 1:
+        return extend_pairwise_alignment(clean[0], query_seq, subject_seq)
+
+    # N-terminal gap-padding
+    first = clean[0]
+    nq, ns = _extend_terminal(
+        query_seq[:first.query_start - 1],
+        subject_seq[:first.subject_start - 1],
+        is_n_terminal=True
+    )
+    parts_q = [nq]
+    parts_s = [ns]
+
+    for i, hsp in enumerate(clean):
+        # Locked anchor
+        parts_q.append(hsp.query_seq)
+        parts_s.append(hsp.subject_seq)
+
+        if i + 1 < len(clean):
+            nxt = clean[i + 1]
+            inter_q = query_seq[hsp.query_end: nxt.query_start - 1]
+            inter_s = subject_seq[hsp.subject_end: nxt.subject_start - 1]
+            # NW when both sides have residues; gap-pad when only one side does
+            if inter_q and inter_s:
+                iq, is_ = needleman_wunsch(inter_q, inter_s)
+            else:
+                iq, is_ = _extend_terminal(inter_q, inter_s, is_n_terminal=False)
+            parts_q.append(iq)
+            parts_s.append(is_)
+
+    # C-terminal gap-padding
+    last = clean[-1]
+    cq, cs = _extend_terminal(
+        query_seq[last.query_end:],
+        subject_seq[last.subject_end:],
+        is_n_terminal=False
+    )
+    parts_q.append(cq)
+    parts_s.append(cs)
+
+    full_q = ''.join(parts_q)
+    full_s = ''.join(parts_s)
+    assert len(full_q) == len(full_s), \
+        f"chain_blast_hsps length mismatch: {len(full_q)} vs {len(full_s)}"
+
+    return AlignedPair(
+        seq1_id=clean[0].query_id,
+        seq2_id=clean[0].subject_id,
+        seq1_aligned=full_q,
+        seq2_aligned=full_s,
+        seq1_original=query_seq,
+        seq2_original=subject_seq
+    )
+
+
 @dataclass
 class AlignedPair:
     """
@@ -161,15 +314,19 @@ class CenterStarAligner:
     
     def build_msa(self, hits: Dict[Tuple[str, str], BlastHit],
                   center_id: Optional[str] = None,
+                  multi_hits: Optional[Dict[Tuple[str, str], List[BlastHit]]] = None,
                   verbose: bool = False) -> Alignment:
         """
         Build MSA from pairwise BLAST hits.
-        
+
         Args:
-            hits: Dictionary of pairwise BLAST results
+            hits: Dictionary of pairwise BLAST results (used for center selection)
             center_id: Optional center sequence ID (auto-detected if None)
+            multi_hits: Optional dict mapping (q_id, s_id) -> List[BlastHit] for
+                        synteny-aware mode. When provided, all HSPs per pair are
+                        chained as positional anchors via chain_blast_hsps().
             verbose: Print progress information
-        
+
         Returns:
             Alignment object with all sequences aligned
         """
@@ -180,31 +337,55 @@ class CenterStarAligner:
                 sequences=[seq],
                 seq_type=self.seq_type
             )
-        
+
         # Use provided center or find it
         if center_id is None:
             center_id = self._find_center(hits)
         self.center_id = center_id
-        
+
         if verbose:
             print(f"  Center sequence: {center_id}")
-        
+
         center_seq = self.sequences[center_id]
         other_ids = [sid for sid in self.seq_ids if sid != center_id]
-        
+
         # Get pairwise alignments of all sequences to center
         pairwise_alignments = {}
-        
+
         for other_id in other_ids:
             other_seq = self.sequences[other_id]
-            
-            # Try to find a hit (check both directions)
+
+            # --- Synteny-aware path: chain all HSPs as anchors ---
+            if multi_hits is not None:
+                hsps = (multi_hits.get((center_id, other_id)) or
+                        multi_hits.get((other_id, center_id)))
+                if hsps:
+                    # Orient all HSPs with center as query
+                    if hsps[0].query_id != center_id:
+                        hsps = [BlastHit(
+                            query_id=h.subject_id,
+                            subject_id=h.query_id,
+                            query_start=h.subject_start,
+                            query_end=h.subject_end,
+                            subject_start=h.query_start,
+                            subject_end=h.query_end,
+                            query_seq=h.subject_seq,
+                            subject_seq=h.query_seq,
+                            evalue=h.evalue,
+                            bitscore=h.bitscore,
+                            identity=h.identity
+                        ) for h in hsps]
+                    pairwise_alignments[other_id] = chain_blast_hsps(
+                        hsps, center_seq.seq, other_seq.seq
+                    )
+                    continue
+
+            # --- Standard path: single best hit ---
             hit = hits.get((center_id, other_id)) or hits.get((other_id, center_id))
-            
+
             if hit:
                 # Ensure hit is oriented with center as query
                 if hit.query_id != center_id:
-                    # Swap the hit orientation
                     hit = BlastHit(
                         query_id=hit.subject_id,
                         subject_id=hit.query_id,
@@ -218,12 +399,12 @@ class CenterStarAligner:
                         bitscore=hit.bitscore,
                         identity=hit.identity
                     )
-                
+
                 pair = extend_pairwise_alignment(hit, center_seq.seq, other_seq.seq)
             else:
                 # No hit found - create fallback alignment
                 pair = create_alignment_no_hit(center_seq, other_seq)
-            
+
             pairwise_alignments[other_id] = pair
         
         # Merge all pairwise alignments

@@ -7,6 +7,7 @@ from .blast_runner import (
 )
 from .alignment import (
     CenterStarAligner, AlignedPair, extend_pairwise_alignment,
+    chain_blast_hsps, needleman_wunsch,
     compute_msa_score, compute_percent_identity, compute_column_score,
     compute_per_sequence_identity, compute_hit_coverage, build_consensus,
 )

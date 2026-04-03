@@ -171,6 +171,13 @@ Output formats:
                        help='Minimum alignment coverage to accept a BLAST hit (default: 0.5)')
     parser.add_argument('--no-coverage-guard', action='store_true',
                        help='Disable coverage guard (equivalent to --coverage-threshold 0)')
+
+    # Synteny-aware MSA
+    parser.add_argument('--synteny', action='store_true',
+                       help='Synteny-aware MSA: use all BLAST HSPs as positional anchors '
+                            'and align inter-anchor segments via Needleman-Wunsch')
+    parser.add_argument('--max-hsps', type=int, default=10,
+                       help='Maximum HSPs per sequence pair in --synteny mode (default: 10)')
     
     # Output options
     parser.add_argument('-v', '--verbose', action='store_true',
@@ -295,24 +302,42 @@ Output formats:
             print()
         
         with BlastRunner(seq_type) as runner:
-            hits = runner.run_all_pairwise(
-                sequences,
-                gap_open=gap_open,
-                gap_extend=gap_extend,
-                word_size=word_size,
-                evalue=evalue,
-                verbose=args.verbose,
-                threads=args.threads,
-                coverage_threshold=coverage_threshold
-            )
-        
+            if args.synteny:
+                if args.verbose:
+                    print("  Mode: synteny-aware (multi-HSP anchoring + NW inter-anchor fill)")
+                multi_hits = runner.run_all_pairwise_multi_hsp(
+                    sequences,
+                    gap_open=gap_open,
+                    gap_extend=gap_extend,
+                    word_size=word_size,
+                    evalue=evalue,
+                    verbose=args.verbose,
+                    threads=args.threads,
+                    max_hsps=args.max_hsps
+                )
+                # Derive single-hit dict for center selection (best bitscore per pair)
+                hits = {k: max(v, key=lambda h: h.bitscore)
+                        for k, v in multi_hits.items()}
+            else:
+                hits = runner.run_all_pairwise(
+                    sequences,
+                    gap_open=gap_open,
+                    gap_extend=gap_extend,
+                    word_size=word_size,
+                    evalue=evalue,
+                    verbose=args.verbose,
+                    threads=args.threads,
+                    coverage_threshold=coverage_threshold
+                )
+                multi_hits = None
+
         if args.verbose:
             print(f"  Found {len(hits)} pairwise alignments")
             print()
             print("Building MSA...")
-        
+
         aligner = CenterStarAligner(sequences, seq_type)
-        alignment = aligner.build_msa(hits, verbose=args.verbose)
+        alignment = aligner.build_msa(hits, multi_hits=multi_hits, verbose=args.verbose)
         alignment.parameters = {
             'gap_open': gap_open,
             'gap_extend': gap_extend,
