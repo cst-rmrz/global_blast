@@ -33,6 +33,21 @@ VALID_BLOSUM62_GAPS = {
     (13, 1), (12, 1), (11, 1), (10, 1), (9, 1)
 }
 
+# Valid blastn (reward, penalty) -> [(gap_open, gap_extend), ...]
+# Verified against BLAST+ error messages. Lists are ordered so the midpoint
+# (used as the representative combo during the scoring sweep) is a safe value.
+BLASTN_SCORING_COMBOS = {
+    (1, -1): [(3, 2), (2, 2), (1, 2), (2, 1), (1, 1)],
+    (1, -2): [(5, 2), (4, 2), (2, 2), (1, 2), (3, 1), (2, 1), (1, 1)],
+    (1, -3): [(5, 2), (4, 2), (2, 2), (1, 2), (2, 1), (1, 1)],
+    (2, -3): [(6, 2), (5, 2), (4, 2), (2, 2), (3, 3), (4, 4), (2, 4), (0, 4)],
+    (2, -5): [(4, 4), (2, 4), (0, 4)],
+    (4, -5): [(6, 5), (5, 5), (4, 5), (3, 5), (12, 8)],
+}
+
+# Default (reward, penalty) pairs to sweep during optimization (nucleotide only)
+DEFAULT_SCORING_PAIRS = [(1, -1), (1, -2), (2, -3), (2, -5), (4, -5)]
+
 
 @dataclass
 class OptimizationResult:
@@ -273,16 +288,19 @@ class ParameterOptimizer:
     def _run_reference_alignments(self, runner: BlastRunner,
                                    gap_open: int, gap_extend: int,
                                    word_size: int, evalue: float,
-                                   threads: int = None) -> float:
+                                   threads: int = None,
+                                   reward: int = None,
+                                   penalty: int = None) -> float:
         """
         Run alignments from reference to all other sequences using database approach.
-        
+
         Creates DB from reference, BLASTs all others against it in one call.
         Much faster than individual pairwise BLASTs.
         """
         hits = runner.run_reference_vs_others(
             self.reference_seq, self.other_seqs,
-            gap_open, gap_extend, word_size, evalue, threads
+            gap_open, gap_extend, word_size, evalue, threads,
+            reward=reward, penalty=penalty
         )
         return self._compute_reference_score(hits)
     
@@ -293,7 +311,8 @@ class ParameterOptimizer:
                  evalue: float = 1e-5,
                  metric: str = 'sp_score',
                  verbose: bool = False,
-                 threads: int = None) -> OptimizationResult:
+                 threads: int = None,
+                 coverage_threshold: float = 0.5) -> OptimizationResult:
         """
         Run efficient parameter optimization.
         
@@ -303,156 +322,173 @@ class ParameterOptimizer:
         For nucleotide sequences, we also use valid combinations.
         """
         scoring_fn = get_scoring_function(metric)
-        
-        # Generate word size values from range
+        is_nucleotide = self.seq_type != SeqType.PROTEIN
+
         word_size_values = list(range(word_size_range[0], word_size_range[1] + 1, word_size_range[2]))
-        
-        # Get valid gap penalty combinations for this sequence type
-        valid_gap_combos = get_valid_gap_combinations(self.seq_type)
-        
-        # Filter to requested ranges
+        scoring_pairs = DEFAULT_SCORING_PAIRS if is_nucleotide else [(None, None)]
+
+        initial_gap_combos = get_valid_gap_combinations(self.seq_type)
         gap_open_min, gap_open_max = gap_open_range[0], gap_open_range[1]
         gap_extend_min, gap_extend_max = gap_extend_range[0], gap_extend_range[1]
-        
-        filtered_gap_combos = [
-            (go, ge) for go, ge in valid_gap_combos
+        filtered_initial_gaps = [
+            (go, ge) for go, ge in initial_gap_combos
             if gap_open_min <= go <= gap_open_max and gap_extend_min <= ge <= gap_extend_max
-        ]
-        
-        if not filtered_gap_combos:
-            # Fall back to the full valid set if filter is too restrictive
-            filtered_gap_combos = valid_gap_combos
-            if verbose:
-                print(f"  Warning: Requested gap ranges have no valid combinations.")
-                print(f"  Using all valid combinations for {self.seq_type.name}.")
-        
+        ] or initial_gap_combos
+
         optimization_trace = {}
         all_results = []
-        
-        n_pairs = len(self.other_seqs)  # N-1 pairs
-        
+        n_pairs = len(self.other_seqs)
+
         if verbose:
             print(f"Univariate parameter optimization")
             print(f"  Reference sequence: {self.reference_seq.id}")
             print(f"  Aligning to {n_pairs} other sequences")
-            print(f"  Parameter values:")
-            print(f"    word_size: {word_size_values}")
-            print(f"    gap penalties (open, extend): {filtered_gap_combos}")
+            print(f"  word_size values: {word_size_values}")
+            if is_nucleotide:
+                print(f"  scoring pairs (reward, penalty): {scoring_pairs}")
+            print(f"  gap penalty combinations: {filtered_initial_gaps}")
             print()
-        
-        # Start with middle values
+
         current_word_size = word_size_values[len(word_size_values) // 2]
-        current_gap_open, current_gap_extend = filtered_gap_combos[len(filtered_gap_combos) // 2]
-        
+        current_gap_open, current_gap_extend = filtered_initial_gaps[len(filtered_initial_gaps) // 2]
+        current_reward, current_penalty = None, None
+
         with BlastRunner(self.seq_type) as runner:
-            # 1. Optimize word_size first (least sensitive)
+
+            # Step 1: word_size
             if verbose:
                 print(f"Optimizing word_size...")
-            
+
             word_size_scores = []
             for ws in word_size_values:
                 if verbose:
                     print(f"  word_size={ws}", end='', flush=True)
-                
                 score = self._run_reference_alignments(
-                    runner,
-                    gap_open=current_gap_open,
-                    gap_extend=current_gap_extend,
-                    word_size=ws,
-                    evalue=evalue,
-                    threads=threads
+                    runner, current_gap_open, current_gap_extend,
+                    ws, evalue, threads, current_reward, current_penalty
                 )
                 word_size_scores.append(score)
-                all_results.append(({'word_size': ws, 'gap_open': current_gap_open, 
-                                    'gap_extend': current_gap_extend}, score))
-                
+                all_results.append(({'word_size': ws, 'gap_open': current_gap_open,
+                                     'gap_extend': current_gap_extend}, score))
                 if verbose:
-                    print(f" -> score: {score:.1f}")
-            
+                    print(f" -> {score:.1f}")
+
             optimal_ws, _, ws_fit = fit_logistic_and_find_optimum(word_size_values, word_size_scores)
             current_word_size = optimal_ws
             optimization_trace['word_size'] = ws_fit
-            
+
             if verbose:
                 print(f"  Optimal word_size: {optimal_ws} (method: {ws_fit['method']})")
                 print()
-            
-            # 2. Optimize gap penalties together (they're interdependent)
+
+            # Step 2: scoring (reward, penalty) — nucleotide only
+            if is_nucleotide:
+                if verbose:
+                    print(f"Optimizing blastn scoring (reward, penalty)...")
+
+                scoring_scores = []
+                for reward, penalty in scoring_pairs:
+                    if verbose:
+                        print(f"  reward={reward}, penalty={penalty}", end='', flush=True)
+                    # Use the midpoint valid gap combo for this scoring pair
+                    pair_gaps = BLASTN_SCORING_COMBOS.get((reward, penalty), filtered_initial_gaps)
+                    sweep_go, sweep_ge = pair_gaps[len(pair_gaps) // 2]
+                    score = self._run_reference_alignments(
+                        runner, sweep_go, sweep_ge,
+                        current_word_size, evalue, threads, reward, penalty
+                    )
+                    scoring_scores.append(score)
+                    all_results.append(({'word_size': current_word_size,
+                                         'reward': reward, 'penalty': penalty,
+                                         'gap_open': sweep_go, 'gap_extend': sweep_ge}, score))
+                    if verbose:
+                        print(f" -> {score:.1f}")
+
+                best_scoring_idx = int(np.argmax(scoring_scores))
+                current_reward, current_penalty = scoring_pairs[best_scoring_idx]
+                optimization_trace['scoring'] = {
+                    'pairs': scoring_pairs,
+                    'scores': scoring_scores,
+                    'best_pair': (current_reward, current_penalty)
+                }
+
+                if verbose:
+                    print(f"  Optimal scoring: reward={current_reward}, penalty={current_penalty}")
+                    print()
+
+                # Re-filter gap combos to those valid for the chosen scoring
+                valid_for_scoring = BLASTN_SCORING_COMBOS.get(
+                    (current_reward, current_penalty), filtered_initial_gaps
+                )
+                filtered_gap_combos = [
+                    (go, ge) for go, ge in valid_for_scoring
+                    if gap_open_min <= go <= gap_open_max and gap_extend_min <= ge <= gap_extend_max
+                ] or valid_for_scoring
+                if (current_gap_open, current_gap_extend) not in filtered_gap_combos:
+                    current_gap_open, current_gap_extend = filtered_gap_combos[len(filtered_gap_combos) // 2]
+            else:
+                filtered_gap_combos = filtered_initial_gaps
+
+            # Step 3: gap penalties
             if verbose:
                 print(f"Optimizing gap penalties...")
-            
+
             gap_scores = []
             for gap_open, gap_extend in filtered_gap_combos:
                 if verbose:
                     print(f"  gap_open={gap_open}, gap_extend={gap_extend}", end='', flush=True)
-                
                 score = self._run_reference_alignments(
-                    runner,
-                    gap_open=gap_open,
-                    gap_extend=gap_extend,
-                    word_size=current_word_size,
-                    evalue=evalue,
-                    threads=threads
+                    runner, gap_open, gap_extend,
+                    current_word_size, evalue, threads, current_reward, current_penalty
                 )
                 gap_scores.append(score)
                 all_results.append(({'word_size': current_word_size, 'gap_open': gap_open,
-                                    'gap_extend': gap_extend}, score))
-                
+                                     'gap_extend': gap_extend}, score))
                 if verbose:
-                    print(f" -> score: {score:.1f}")
-            
-            # Find best gap penalty combination
-            best_idx = np.argmax(gap_scores)
+                    print(f" -> {score:.1f}")
+
+            best_idx = int(np.argmax(gap_scores))
             best_score = gap_scores[best_idx]
-            
-            # Check for ties
             max_indices = [i for i, s in enumerate(gap_scores) if s == best_score]
             if len(max_indices) > 1:
-                # Average the tied combinations
-                avg_gap_open = int(np.round(np.mean([filtered_gap_combos[i][0] for i in max_indices])))
-                avg_gap_extend = int(np.round(np.mean([filtered_gap_combos[i][1] for i in max_indices])))
-                # Find closest valid combination
-                best_combo = min(filtered_gap_combos, 
-                                key=lambda x: abs(x[0] - avg_gap_open) + abs(x[1] - avg_gap_extend))
-                method = 'max_with_tie_average'
+                avg_go = int(np.round(np.mean([filtered_gap_combos[i][0] for i in max_indices])))
+                avg_ge = int(np.round(np.mean([filtered_gap_combos[i][1] for i in max_indices])))
+                best_combo = min(filtered_gap_combos,
+                                 key=lambda x: abs(x[0] - avg_go) + abs(x[1] - avg_ge))
+                gap_method = 'max_with_tie_average'
             else:
                 best_combo = filtered_gap_combos[best_idx]
-                method = 'direct_max'
-            
+                gap_method = 'direct_max'
+
             current_gap_open, current_gap_extend = best_combo
             optimization_trace['gap_penalties'] = {
-                'method': method,
-                'combinations': filtered_gap_combos,
-                'scores': gap_scores,
-                'best_combo': best_combo
+                'method': gap_method, 'combinations': filtered_gap_combos,
+                'scores': gap_scores, 'best_combo': best_combo
             }
-            
+
             if verbose:
                 print(f"  Optimal gap_open={current_gap_open}, gap_extend={current_gap_extend} "
-                      f"(method: {method})")
+                      f"(method: {gap_method})")
                 print()
-        
-        # Final optimal parameters
-        best_params = {
+
+        best_params: Dict = {
             'gap_open': current_gap_open,
             'gap_extend': current_gap_extend,
-            'word_size': current_word_size
+            'word_size': current_word_size,
         }
-        
-        # Print final optimal parameters
+        if is_nucleotide:
+            best_params['reward'] = current_reward
+            best_params['penalty'] = current_penalty
+
         if verbose:
             print("=" * 50)
             print("OPTIMAL PARAMETERS:")
-            print(f"  gap_open:   {best_params['gap_open']}")
-            print(f"  gap_extend: {best_params['gap_extend']}")
-            print(f"  word_size:  {best_params['word_size']}")
+            for k, v in best_params.items():
+                print(f"  {k}: {v}")
             print("=" * 50)
             print()
-        
-        # Build final MSA with optimal parameters
-        if verbose:
             print("Building final MSA with optimal parameters...")
-        
+
         with BlastRunner(self.seq_type) as runner:
             hits = runner.run_all_pairwise(
                 self.sequences,
@@ -461,20 +497,22 @@ class ParameterOptimizer:
                 word_size=best_params['word_size'],
                 evalue=evalue,
                 verbose=verbose,
-                threads=threads
+                threads=threads,
+                coverage_threshold=coverage_threshold,
+                reward=best_params.get('reward'),
+                penalty=best_params.get('penalty')
             )
-        
+
         aligner = CenterStarAligner(self.sequences, self.seq_type)
         alignment = aligner.build_msa(hits, verbose=verbose)
         alignment.parameters = best_params.copy()
-        
-        # Score final alignment
+
         final_score = scoring_fn(alignment)
         alignment.score = final_score
-        
+
         if verbose:
             print(f"Final {metric}: {final_score:.2f}")
-        
+
         return OptimizationResult(
             best_alignment=alignment,
             best_params=best_params,

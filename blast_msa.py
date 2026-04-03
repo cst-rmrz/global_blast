@@ -169,6 +169,20 @@ Output formats:
                        help='Maximum refinement iterations (default: 3)')
     parser.add_argument('--coverage-threshold', type=float, default=None,
                        help='Minimum alignment coverage to accept a BLAST hit (default: 0.5)')
+    parser.add_argument('--no-coverage-guard', action='store_true',
+                       help='Disable coverage guard retry for low-coverage BLAST hits')
+
+    # Iterative center-star
+    parser.add_argument('--iterative', action='store_true',
+                       help='Iterative center-star: re-align poor sequences among themselves '
+                            'and merge back via bridge alignment')
+    parser.add_argument('--identity-threshold', type=float, default=50.0,
+                       help='Percent identity threshold for --iterative (default: 50.0)')
+    parser.add_argument('--iterative-max-iter', type=int, default=5,
+                       help='Maximum iterations for --iterative (default: 5)')
+    parser.add_argument('--low-coverage-hsp', type=int, default=1,
+                       help='Number of HSPs to search during --iterative sub-group '
+                            'BLAST and bridge alignment (default: 1)')
     
     # Output options
     parser.add_argument('-v', '--verbose', action='store_true',
@@ -239,7 +253,8 @@ Output formats:
     
     evalue = args.evalue if args.evalue is not None else params['evalue']
 
-    coverage_threshold = (args.coverage_threshold if args.coverage_threshold is not None
+    coverage_threshold = (0.0 if args.no_coverage_guard
+                         else args.coverage_threshold if args.coverage_threshold is not None
                          else params['coverage_threshold'])
     refine = args.refine or params['refine']
     refine_iterations = (args.refine_iterations if args.refine_iterations is not None
@@ -271,7 +286,8 @@ Output formats:
             evalue=evalue,
             metric=metric,
             verbose=args.verbose,
-            threads=args.threads
+            threads=args.threads,
+            coverage_threshold=coverage_threshold
         )
         
         alignment = result.best_alignment
@@ -333,6 +349,31 @@ Output formats:
 
         if args.verbose:
             print("  Refinement complete")
+            print()
+
+    # Iterative center-star (opt-in via --iterative)
+    if args.iterative:
+        if args.verbose:
+            print("Running iterative center-star refinement...")
+
+        iter_aligner = CenterStarAligner(sequences, seq_type)
+        iter_aligner.center_id = alignment.sequences[0].id
+
+        alignment = iter_aligner.iterative_refine(
+            alignment,
+            gap_open=gap_open,
+            gap_extend=gap_extend,
+            word_size=word_size,
+            evalue=evalue,
+            identity_threshold=args.identity_threshold,
+            max_iterations=args.iterative_max_iter,
+            coverage_threshold=coverage_threshold,
+            max_hsps=args.low_coverage_hsp,
+            verbose=args.verbose
+        )
+
+        if args.verbose:
+            print("  Iterative refinement complete")
             print()
 
     # Validate alignment
