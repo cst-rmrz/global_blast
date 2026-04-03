@@ -281,7 +281,8 @@ Output formats:
             evalue=evalue,
             metric=metric,
             verbose=args.verbose,
-            threads=args.threads
+            threads=args.threads,
+            coverage_threshold=coverage_threshold
         )
         
         alignment = result.best_alignment

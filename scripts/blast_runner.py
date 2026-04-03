@@ -320,29 +320,26 @@ class BlastRunner:
     
     def run_against_database(self, queries: List[Sequence], db_path: Path,
                               gap_open: int, gap_extend: int, word_size: int,
-                              evalue: float, threads: int = 1) -> Dict[Tuple[str, str], BlastHit]:
+                              evalue: float, threads: int = 1,
+                              reward: Optional[int] = None,
+                              penalty: Optional[int] = None) -> Dict[Tuple[str, str], BlastHit]:
         """
         Run all query sequences against a BLAST database in a single call.
-        
-        This is much more efficient than individual pairwise BLASTs:
-        - Single subprocess spawn
-        - BLAST handles internal parallelization
-        - Database index is built once and reused
-        
+
+        reward/penalty: blastn match/mismatch scores. When provided, override the
+        BLAST defaults (1/-2). Ignored for blastp.
+
         Returns:
             Dictionary mapping (query_id, subject_id) to BlastHit
         """
         if not queries:
             return {}
-        
-        # Write all queries to single FASTA
+
         query_path = Path(self.temp_dir) / 'queries.fasta'
         with open(query_path, 'w') as f:
             for seq in queries:
                 f.write(f">{seq.id}\n{seq.seq}\n")
-        
-        # Run BLAST with all queries at once
-        # Use max_target_seqs equal to number of sequences to get all hits
+
         n_seqs = len(queries)
         cmd = [
             self.blast_cmd,
@@ -353,60 +350,58 @@ class BlastRunner:
             '-word_size', str(word_size),
             '-evalue', str(evalue),
             '-outfmt', '6 qseqid sseqid qstart qend sstart send qseq sseq evalue bitscore pident qlen slen',
-            '-max_target_seqs', str(max(n_seqs + 5, 10)),  # Get enough hits
+            '-max_target_seqs', str(max(n_seqs + 5, 10)),
             '-max_hsps', '1',
             '-num_threads', str(threads)
         ]
-        
+        if self.blast_cmd == 'blastn' and reward is not None and penalty is not None:
+            cmd += ['-reward', str(reward), '-penalty', str(penalty)]
+
         result = subprocess.run(cmd, capture_output=True, text=True)
-        
+
         if result.returncode != 0 and 'error' in result.stderr.lower():
             raise RuntimeError(f"BLAST failed: {result.stderr}")
-        
-        # Parse results - keep best hit per query-subject pair
+
         hits = {}
         for hit in _parse_blast_output(result.stdout):
-            # Skip self-hits
             if hit.query_id == hit.subject_id:
                 continue
-            
             key = (hit.query_id, hit.subject_id)
-            # Keep hit with best bitscore if we see the same pair twice
             if key not in hits or hit.bitscore > hits[key].bitscore:
                 hits[key] = hit
-        
+
         return hits
-    
+
     def run_reference_vs_others(self, reference: Sequence, others: List[Sequence],
                                  gap_open: int, gap_extend: int, word_size: int,
-                                 evalue: float, threads: int = None) -> Dict[Tuple[str, str], BlastHit]:
+                                 evalue: float, threads: int = None,
+                                 reward: Optional[int] = None,
+                                 penalty: Optional[int] = None) -> Dict[Tuple[str, str], BlastHit]:
         """
         Efficiently align a reference sequence against all others.
-        
+
         Creates a database from the reference, then BLASTs all others against it.
         Also runs the reverse (others as DB, reference as query) to get both directions.
-        
-        This is optimized for the center-star MSA approach and parameter optimization.
         """
         if threads is None:
             threads = max(1, multiprocessing.cpu_count() - 1)
-        
+
         hits = {}
-        
-        # Forward: others query against reference DB
+
         ref_db = self.create_database([reference], db_name='ref_db')
         forward_hits = self.run_against_database(
-            others, ref_db, gap_open, gap_extend, word_size, evalue, threads
+            others, ref_db, gap_open, gap_extend, word_size, evalue, threads,
+            reward=reward, penalty=penalty
         )
         hits.update(forward_hits)
-        
-        # Reverse: reference query against others DB
+
         others_db = self.create_database(others, db_name='others_db')
         reverse_hits = self.run_against_database(
-            [reference], others_db, gap_open, gap_extend, word_size, evalue, threads
+            [reference], others_db, gap_open, gap_extend, word_size, evalue, threads,
+            reward=reward, penalty=penalty
         )
         hits.update(reverse_hits)
-        
+
         return hits
     
     def run_pairwise(self, query: Sequence, subject: Sequence,
@@ -441,7 +436,9 @@ class BlastRunner:
                          word_size: int = None, evalue: float = 1e-5,
                          verbose: bool = False,
                          threads: int = None,
-                         coverage_threshold: float = 0.5) -> Dict[Tuple[str, str], BlastHit]:
+                         coverage_threshold: float = 0.5,
+                         reward: Optional[int] = None,
+                         penalty: Optional[int] = None) -> Dict[Tuple[str, str], BlastHit]:
         """
         Run all pairwise BLASTs between sequences.
 
@@ -479,7 +476,8 @@ class BlastRunner:
 
         # BLAST all sequences against the database
         hits = self.run_against_database(
-            sequences, all_db, gap_open, gap_extend, word_size, evalue, threads
+            sequences, all_db, gap_open, gap_extend, word_size, evalue, threads,
+            reward=reward, penalty=penalty
         )
 
         if verbose:
