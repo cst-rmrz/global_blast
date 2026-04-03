@@ -47,43 +47,43 @@ class BlastHit:
 def _run_single_blast(args: Tuple) -> Tuple[Tuple[str, str], Optional[BlastHit], Optional[BlastHit]]:
     """
     Worker function for parallel BLAST execution.
-    
+
     Args:
-        args: Tuple of (seq1_id, seq1_seq, seq2_id, seq2_seq, blast_cmd, gap_open, gap_extend, word_size, evalue, temp_dir)
-    
+        args: Tuple of (seq1_id, seq1_seq, seq2_id, seq2_seq, blast_cmd, gap_open, gap_extend, word_size, evalue, temp_dir, distant)
+
     Returns:
         Tuple of ((id1, id2), forward_hit, reverse_hit)
     """
-    (seq1_id, seq1_seq, seq2_id, seq2_seq, 
-     blast_cmd, gap_open, gap_extend, word_size, evalue, temp_dir) = args
-    
+    (seq1_id, seq1_seq, seq2_id, seq2_seq,
+     blast_cmd, gap_open, gap_extend, word_size, evalue, temp_dir, distant) = args
+
     # Create unique temp files for this pair
     import uuid
     pair_id = uuid.uuid4().hex[:8]
     query_path = Path(temp_dir) / f'query_{pair_id}.fasta'
     subject_path = Path(temp_dir) / f'subject_{pair_id}.fasta'
-    
+
     try:
         # Write sequences
         with open(query_path, 'w') as f:
             f.write(f">{seq1_id}\n{seq1_seq}\n")
         with open(subject_path, 'w') as f:
             f.write(f">{seq2_id}\n{seq2_seq}\n")
-        
+
         # Run forward BLAST (seq1 vs seq2)
         hit_forward = _execute_blast(
             query_path, subject_path, blast_cmd,
-            gap_open, gap_extend, word_size, evalue
+            gap_open, gap_extend, word_size, evalue, distant=distant
         )
-        
+
         # Run reverse BLAST (seq2 vs seq1)
         hit_reverse = _execute_blast(
             subject_path, query_path, blast_cmd,
-            gap_open, gap_extend, word_size, evalue
+            gap_open, gap_extend, word_size, evalue, distant=distant
         )
-        
+
         return ((seq1_id, seq2_id), hit_forward, hit_reverse)
-    
+
     finally:
         # Clean up temp files
         if query_path.exists():
@@ -94,7 +94,8 @@ def _run_single_blast(args: Tuple) -> Tuple[Tuple[str, str], Optional[BlastHit],
 
 def _execute_blast(query_path: Path, subject_path: Path, blast_cmd: str,
                    gap_open: int, gap_extend: int, word_size: int,
-                   evalue: float, max_hsps: int = 1) -> Optional[BlastHit]:
+                   evalue: float, max_hsps: int = 1,
+                   distant: bool = False) -> Optional[BlastHit]:
     """Execute a single BLAST command and parse result."""
     cmd = [
         blast_cmd,
@@ -108,6 +109,11 @@ def _execute_blast(query_path: Path, subject_path: Path, blast_cmd: str,
         '-max_target_seqs', '1',
         '-max_hsps', str(max_hsps)
     ]
+    if distant:
+        if blast_cmd == 'blastn':
+            cmd += ['-reward', '1', '-penalty', '-2', '-dust', 'no']
+        else:
+            cmd += ['-seg', 'no']
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -184,13 +190,13 @@ def _retry_single_pair(args: Tuple) -> Tuple[Tuple[str, str], Optional[BlastHit]
 
     Args:
         args: Tuple of (id1, seq1, id2, seq2, blast_cmd, gap_open, gap_extend,
-              word_size, evalue, temp_dir)
+              word_size, evalue, temp_dir, distant)
 
     Returns:
         Tuple of ((id1, id2), forward_hit, reverse_hit)
     """
     (id1, seq1, id2, seq2,
-     blast_cmd, gap_open, gap_extend, word_size, evalue, temp_dir) = args
+     blast_cmd, gap_open, gap_extend, word_size, evalue, temp_dir, distant) = args
 
     import uuid
     pair_id = uuid.uuid4().hex[:8]
@@ -205,11 +211,11 @@ def _retry_single_pair(args: Tuple) -> Tuple[Tuple[str, str], Optional[BlastHit]
 
         fwd = _execute_blast(
             query_path, subject_path, blast_cmd,
-            gap_open, gap_extend, word_size, evalue, max_hsps=3
+            gap_open, gap_extend, word_size, evalue, max_hsps=3, distant=distant
         )
         rev = _execute_blast(
             subject_path, query_path, blast_cmd,
-            gap_open, gap_extend, word_size, evalue, max_hsps=3
+            gap_open, gap_extend, word_size, evalue, max_hsps=3, distant=distant
         )
 
         return ((id1, id2), fwd, rev)
@@ -320,7 +326,8 @@ class BlastRunner:
     
     def run_against_database(self, queries: List[Sequence], db_path: Path,
                               gap_open: int, gap_extend: int, word_size: int,
-                              evalue: float, threads: int = 1) -> Dict[Tuple[str, str], BlastHit]:
+                              evalue: float, threads: int = 1,
+                              distant: bool = False) -> Dict[Tuple[str, str], BlastHit]:
         """
         Run all query sequences against a BLAST database in a single call.
         
@@ -357,6 +364,11 @@ class BlastRunner:
             '-max_hsps', '1',
             '-num_threads', str(threads)
         ]
+        if distant:
+            if self.blast_cmd == 'blastn':
+                cmd += ['-reward', '1', '-penalty', '-2', '-dust', 'no']
+            else:
+                cmd += ['-seg', 'no']
         
         result = subprocess.run(cmd, capture_output=True, text=True)
         
@@ -441,7 +453,8 @@ class BlastRunner:
                          word_size: int = None, evalue: float = 1e-5,
                          verbose: bool = False,
                          threads: int = None,
-                         coverage_threshold: float = 0.5) -> Dict[Tuple[str, str], BlastHit]:
+                         coverage_threshold: float = 0.5,
+                         distant: bool = False) -> Dict[Tuple[str, str], BlastHit]:
         """
         Run all pairwise BLASTs between sequences.
 
@@ -479,7 +492,8 @@ class BlastRunner:
 
         # BLAST all sequences against the database
         hits = self.run_against_database(
-            sequences, all_db, gap_open, gap_extend, word_size, evalue, threads
+            sequences, all_db, gap_open, gap_extend, word_size, evalue, threads,
+            distant=distant
         )
 
         if verbose:
@@ -490,7 +504,7 @@ class BlastRunner:
             seq_lens = {s.id: len(s.seq) for s in sequences}
             hits = self._retry_low_coverage_hits(
                 hits, sequences, seq_lens, word_size, evalue,
-                coverage_threshold, verbose
+                coverage_threshold, verbose, distant=distant
             )
 
         return hits
@@ -501,7 +515,8 @@ class BlastRunner:
                                   original_word_size: int,
                                   original_evalue: float,
                                   coverage_threshold: float,
-                                  verbose: bool) -> Dict[Tuple[str, str], BlastHit]:
+                                  verbose: bool,
+                                  distant: bool = False) -> Dict[Tuple[str, str], BlastHit]:
         """
         Retry BLAST for pairs where the alignment covers less than the threshold
         of the query sequence. Uses more sensitive parameters, multiple HSPs,
@@ -539,7 +554,7 @@ class BlastRunner:
             retry_args.append((
                 id1, seq_map[id1].seq, id2, seq_map[id2].seq,
                 self.blast_cmd, sensitive_gap_open, sensitive_gap_extend,
-                sensitive_word_size, sensitive_evalue, self.temp_dir
+                sensitive_word_size, sensitive_evalue, self.temp_dir, distant
             ))
 
         # Run retries in parallel
@@ -573,25 +588,63 @@ class BlastRunner:
 
     def run_vs_consensus(self, query: Sequence, consensus_seq: str,
                           gap_open: int = 5, gap_extend: int = 2,
-                          word_size: int = 7, evalue: float = 1e-3) -> Optional[BlastHit]:
+                          word_size: int = 7, evalue: float = 1e-3,
+                          distant: bool = False) -> Optional[BlastHit]:
         """
         BLAST a single sequence against a consensus string.
 
         Uses sensitive parameters by default since this is for realigning
         divergent sequences during iterative refinement.
+
+        When distant=True, also runs the reciprocal direction (consensus→query)
+        and returns the hit with the higher percent identity.
         """
-        query_path = Path(self.temp_dir) / 'refine_query.fasta'
-        subject_path = Path(self.temp_dir) / 'refine_consensus.fasta'
+        import uuid
+        pair_id = uuid.uuid4().hex[:8]
+        query_path = Path(self.temp_dir) / f'refine_query_{pair_id}.fasta'
+        subject_path = Path(self.temp_dir) / f'refine_consensus_{pair_id}.fasta'
 
         with open(query_path, 'w') as f:
             f.write(f">{query.id}\n{query.seq}\n")
         with open(subject_path, 'w') as f:
             f.write(f">consensus\n{consensus_seq}\n")
 
-        return _execute_blast(
+        fwd = _execute_blast(
             query_path, subject_path, self.blast_cmd,
-            gap_open, gap_extend, word_size, evalue, max_hsps=3
+            gap_open, gap_extend, word_size, evalue, max_hsps=3, distant=distant
         )
+
+        if not distant:
+            return fwd
+
+        # Reciprocal: consensus as query, sequence as subject
+        rev_raw = _execute_blast(
+            subject_path, query_path, self.blast_cmd,
+            gap_open, gap_extend, word_size, evalue, max_hsps=3, distant=True
+        )
+
+        if rev_raw is None:
+            return fwd
+
+        # Flip rev_raw so it has the same orientation as fwd (query=sequence, subject=consensus)
+        rev = BlastHit(
+            query_id=rev_raw.subject_id,
+            subject_id=rev_raw.query_id,
+            query_start=rev_raw.subject_start,
+            query_end=rev_raw.subject_end,
+            subject_start=rev_raw.query_start,
+            subject_end=rev_raw.query_end,
+            query_seq=rev_raw.subject_seq,
+            subject_seq=rev_raw.query_seq,
+            evalue=rev_raw.evalue,
+            bitscore=rev_raw.bitscore,
+            identity=rev_raw.identity
+        )
+
+        if fwd is None:
+            return rev
+
+        return fwd if fwd.identity >= rev.identity else rev
 
 
 def compute_pairwise_scores(hits: Dict[Tuple[str, str], BlastHit],

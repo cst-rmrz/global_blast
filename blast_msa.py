@@ -35,6 +35,7 @@ from scripts import (
     parse_param_range,
     compute_msa_score,
     compute_percent_identity,
+    compute_per_sequence_identity,
 )
 
 
@@ -64,9 +65,9 @@ def load_params(params_file: Path) -> Dict[str, Any]:
         # Extension parameters
         'extend_termini': True,
         'terminal_gap_penalty': 0,
-        # Refinement parameters
-        'refine': False,
-        'refine_iterations': 3,
+        # Distant/refinement parameters
+        'distant': False,
+        'distant_iterations': 3,
         'coverage_threshold': 0.5,
         # Output parameters
         'default_format': 'fasta',
@@ -100,11 +101,11 @@ def load_params(params_file: Path) -> Dict[str, Any]:
                 params[key] = int(value)
             elif key == 'evalue':
                 params[key] = float(value)
-            elif key in ('extend_termini', 'refine'):
+            elif key in ('extend_termini', 'distant'):
                 params[key] = value.lower() in ('true', 'yes', '1')
             elif key == 'coverage_threshold':
                 params[key] = float(value)
-            elif key == 'refine_iterations':
+            elif key == 'distant_iterations':
                 params[key] = int(value)
             elif key.startswith('optimize_') and key != 'optimize_metric':
                 # Parse range format "start:stop:step"
@@ -162,11 +163,17 @@ Output formats:
                        choices=['sp_score', 'percent_identity', 'column_score'],
                        help='Scoring metric for optimization (default: sp_score)')
 
-    # Refinement
-    parser.add_argument('--refine', action='store_true',
-                       help='Iterative refinement: detect and realign poorly-placed sequences')
-    parser.add_argument('--refine-iterations', type=int, default=None,
-                       help='Maximum refinement iterations (default: 3)')
+    # Distant mode and profile refinement
+    parser.add_argument('--distant', action='store_true',
+                       help='Use relaxed BLAST scoring (-reward 1 -penalty -2 -dust no) with '
+                            'reciprocal alignment; assumes sequences are related despite low identity')
+    parser.add_argument('--distant-iterations', type=int, default=None,
+                       help='Maximum refinement iterations for --distant (default: 3)')
+    parser.add_argument('--profile', action='store_true',
+                       help='Re-align sequences below --identity-threshold against a consensus '
+                            'profile built from the well-aligned sequences')
+    parser.add_argument('--identity-threshold', type=float, default=70.0,
+                       help='Percent identity threshold for --profile (default: 70.0)')
     parser.add_argument('--coverage-threshold', type=float, default=None,
                        help='Minimum alignment coverage to accept a BLAST hit (default: 0.5)')
     
@@ -241,9 +248,9 @@ Output formats:
 
     coverage_threshold = (args.coverage_threshold if args.coverage_threshold is not None
                          else params['coverage_threshold'])
-    refine = args.refine or params['refine']
-    refine_iterations = (args.refine_iterations if args.refine_iterations is not None
-                        else params['refine_iterations'])
+    distant = args.distant or params['distant']
+    distant_iterations = (args.distant_iterations if args.distant_iterations is not None
+                         else params['distant_iterations'])
 
     # Run alignment
     if args.optimize:
@@ -300,7 +307,8 @@ Output formats:
                 evalue=evalue,
                 verbose=args.verbose,
                 threads=args.threads,
-                coverage_threshold=coverage_threshold
+                coverage_threshold=coverage_threshold,
+                distant=distant
             )
         
         if args.verbose:
@@ -316,24 +324,51 @@ Output formats:
             'word_size': word_size
         }
     
-    # Iterative refinement (opt-in via --refine)
-    if refine:
+    # Distant mode: iterative refinement with relaxed BLAST scoring
+    if distant:
         if args.verbose:
-            print("Running iterative refinement...")
+            print("Running distant-mode refinement...")
 
-        refine_aligner = CenterStarAligner(sequences, seq_type)
-        # Use the first sequence in the alignment as center (it's always the center)
-        refine_aligner.center_id = alignment.sequences[0].id
+        distant_aligner = CenterStarAligner(sequences, seq_type)
+        distant_aligner.center_id = alignment.sequences[0].id
 
-        alignment = refine_aligner.refine_msa(
+        alignment = distant_aligner.refine_msa(
             alignment,
-            max_iterations=refine_iterations,
-            verbose=args.verbose
+            max_iterations=distant_iterations,
+            verbose=args.verbose,
+            distant=True
         )
 
         if args.verbose:
-            print("  Refinement complete")
+            print("  Distant refinement complete")
             print()
+
+    # Profile refinement: report and re-align sequences below identity threshold
+    if args.profile:
+        scores = compute_per_sequence_identity(alignment)
+        poor_ids = [sid for sid, score in scores.items()
+                    if score < args.identity_threshold]
+
+        print(f"\nProfile: {len(poor_ids)}/{alignment.n_seqs} sequences "
+              f"below {args.identity_threshold:.0f}% identity")
+        if poor_ids and args.verbose:
+            for sid in sorted(poor_ids, key=lambda x: scores[x]):
+                print(f"  {sid}: {scores[sid]:.1f}%")
+
+        if poor_ids:
+            profile_aligner = CenterStarAligner(sequences, seq_type)
+            profile_aligner.center_id = alignment.sequences[0].id
+
+            alignment = profile_aligner.profile_refine(
+                alignment,
+                identity_threshold=args.identity_threshold,
+                distant=distant,
+                verbose=args.verbose
+            )
+
+            if args.verbose:
+                print("  Profile realignment complete")
+                print()
 
     # Validate alignment
     if not alignment.is_valid():

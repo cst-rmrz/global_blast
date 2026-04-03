@@ -414,7 +414,8 @@ class CenterStarAligner:
 
     def refine_msa(self, alignment: Alignment,
                    max_iterations: int = 3,
-                   verbose: bool = False) -> Alignment:
+                   verbose: bool = False,
+                   distant: bool = False) -> Alignment:
         """
         Iterative refinement: detect poorly-aligned sequences, remove them,
         build consensus from remaining, re-BLAST against consensus, reinsert.
@@ -478,7 +479,8 @@ class CenterStarAligner:
                         gap_open=5 if self.seq_type != SeqType.PROTEIN else 11,
                         gap_extend=2 if self.seq_type != SeqType.PROTEIN else 1,
                         word_size=sensitive_ws,
-                        evalue=sensitive_evalue
+                        evalue=sensitive_evalue,
+                        distant=distant
                     )
                     if hit:
                         # The hit has subject_id='consensus', remap to center
@@ -558,6 +560,106 @@ class CenterStarAligner:
             )
 
         return current
+
+    def profile_refine(self, alignment: Alignment,
+                       identity_threshold: float = 70.0,
+                       distant: bool = False,
+                       verbose: bool = False) -> Alignment:
+        """
+        Re-align sequences below identity_threshold against a consensus profile
+        built from the well-aligned sequences.
+
+        Unlike refine_msa(), uses a fixed threshold (not statistical), runs once,
+        and is intended to be called after the caller has already reported poor counts.
+        """
+        scores = compute_per_sequence_identity(alignment)
+        poor_ids = [sid for sid, score in scores.items()
+                    if score < identity_threshold and sid != self.center_id]
+
+        if not poor_ids:
+            return alignment
+
+        good_seqs = [s for s in alignment.sequences if s.id not in poor_ids]
+        if len(good_seqs) < 2:
+            if verbose:
+                print("  Too few well-aligned sequences to build consensus, skipping")
+            return alignment
+
+        good_alignment = Alignment(sequences=good_seqs, seq_type=alignment.seq_type)
+        consensus_seq = build_consensus(good_alignment, gap_threshold=0.5)
+
+        if not consensus_seq:
+            if verbose:
+                print("  Could not build consensus, skipping profile refinement")
+            return alignment
+
+        poor_seq_map = {s.id: s for s in self.sequences.values() if s.id in poor_ids}
+        word_size = 7 if self.seq_type != SeqType.PROTEIN else 2
+
+        new_hits = {}
+        with BlastRunner(self.seq_type) as runner:
+            for sid, seq in poor_seq_map.items():
+                hit = runner.run_vs_consensus(
+                    seq, consensus_seq,
+                    gap_open=5 if self.seq_type != SeqType.PROTEIN else 11,
+                    gap_extend=2 if self.seq_type != SeqType.PROTEIN else 1,
+                    word_size=word_size,
+                    evalue=1e-3,
+                    distant=distant
+                )
+                if hit:
+                    new_hits[(self.center_id, sid)] = BlastHit(
+                        query_id=hit.subject_id,
+                        subject_id=hit.query_id,
+                        query_start=hit.subject_start,
+                        query_end=hit.subject_end,
+                        subject_start=hit.query_start,
+                        subject_end=hit.query_end,
+                        query_seq=hit.subject_seq,
+                        subject_seq=hit.query_seq,
+                        evalue=hit.evalue,
+                        bitscore=hit.bitscore,
+                        identity=hit.identity
+                    )
+
+        if not new_hits:
+            if verbose:
+                print("  No improved hits found from profile realignment")
+            return alignment
+
+        refined_seqs = list(good_seqs)
+
+        for sid in poor_ids:
+            hit_key = (self.center_id, sid)
+            if hit_key in new_hits:
+                hit = new_hits[hit_key]
+                pair = extend_pairwise_alignment(hit, consensus_seq, poor_seq_map[sid].seq)
+                aligned_seq = self._map_to_msa_columns(
+                    pair.seq2_aligned, pair.seq1_aligned, good_alignment
+                )
+                if verbose:
+                    print(f"    {sid}: {scores[sid]:.1f}% → realigned against profile")
+                refined_seqs.append(Sequence(
+                    id=sid,
+                    description=poor_seq_map[sid].description,
+                    seq=aligned_seq
+                ))
+            else:
+                orig = next((s for s in alignment.sequences if s.id == sid), None)
+                if orig:
+                    refined_seqs.append(orig)
+
+        max_len = max(len(s.seq) for s in refined_seqs)
+        for s in refined_seqs:
+            if len(s.seq) < max_len:
+                s.seq = s.seq + '-' * (max_len - len(s.seq))
+
+        return Alignment(
+            sequences=refined_seqs,
+            seq_type=alignment.seq_type,
+            parameters=alignment.parameters,
+            score=alignment.score
+        )
 
     def _map_to_msa_columns(self, seq_aligned_to_consensus: str,
                              consensus_aligned: str,

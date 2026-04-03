@@ -49,14 +49,15 @@ optimize_word_size_nucleotide = 7:15:2
 optimize_metric = sp_score
 
 # =============================================================================
-# Refinement Parameters
+# Distant Mode / Refinement Parameters
 # =============================================================================
 
-# Enable iterative refinement (requires --refine flag or set to true here)
-refine = false
+# Enable distant mode: relaxed BLAST scoring + reciprocal alignment + refinement
+# (requires --distant flag or set to true here)
+distant = false
 
-# Maximum refinement iterations
-refine_iterations = 3
+# Maximum refinement iterations for distant mode
+distant_iterations = 3
 
 # Minimum alignment coverage threshold (0.0-1.0)
 # Hits covering less than this fraction of the query are retried with
