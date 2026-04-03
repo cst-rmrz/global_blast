@@ -713,84 +713,95 @@ class CenterStarAligner:
                     print(f"  Could not build consensus, stopping refinement")
                 break
 
-            # Re-BLAST poor sequences against consensus
+            # Classify poor sequences: leading-gap sequences use NW global
+            # alignment against the consensus; others use BLAST.
             poor_seq_map = {s.id: s for s in self.sequences.values()
                            if s.id in poor_ids}
 
-            # Sensitive parameters for realignment
-            sensitive_ws = 7 if self.seq_type != SeqType.PROTEIN else 2
-            sensitive_evalue = 1e-3
+            leading_gap_ids = set()
+            if max_leading_gaps > 0:
+                for seq in current.sequences:
+                    if seq.id in poor_ids:
+                        n_leading = len(seq.seq) - len(seq.seq.lstrip('-'))
+                        if n_leading > max_leading_gaps:
+                            leading_gap_ids.add(seq.id)
 
+            blast_ids = [sid for sid in poor_ids if sid not in leading_gap_ids]
+
+            # NW path: global align ungapped sequence to consensus, then map to MSA
+            nw_aligned = {}
+            for sid in leading_gap_ids:
+                ungapped = self.sequences[sid].seq.replace('-', '')
+                cons_aln, seq_aln = needleman_wunsch(consensus_seq, ungapped)
+                nw_aligned[sid] = (cons_aln, seq_aln)
+
+            # BLAST path: sensitive local alignment against consensus
             new_hits = {}
-            with BlastRunner(self.seq_type) as runner:
-                for sid, seq in poor_seq_map.items():
-                    hit = runner.run_vs_consensus(
-                        seq, consensus_seq,
-                        gap_open=5 if self.seq_type != SeqType.PROTEIN else 11,
-                        gap_extend=2 if self.seq_type != SeqType.PROTEIN else 1,
-                        word_size=sensitive_ws,
-                        evalue=sensitive_evalue
-                    )
-                    if hit:
-                        # The hit has subject_id='consensus', remap to center
-                        new_hits[(self.center_id, sid)] = BlastHit(
-                            query_id=hit.subject_id,
-                            subject_id=hit.query_id,
-                            query_start=hit.subject_start,
-                            query_end=hit.subject_end,
-                            subject_start=hit.query_start,
-                            subject_end=hit.query_end,
-                            query_seq=hit.subject_seq,
-                            subject_seq=hit.query_seq,
-                            evalue=hit.evalue,
-                            bitscore=hit.bitscore,
-                            identity=hit.identity
+            if blast_ids:
+                sensitive_ws = 7 if self.seq_type != SeqType.PROTEIN else 2
+                sensitive_evalue = 1e-3
+                with BlastRunner(self.seq_type) as runner:
+                    for sid in blast_ids:
+                        seq = poor_seq_map[sid]
+                        hit = runner.run_vs_consensus(
+                            seq, consensus_seq,
+                            gap_open=5 if self.seq_type != SeqType.PROTEIN else 11,
+                            gap_extend=2 if self.seq_type != SeqType.PROTEIN else 1,
+                            word_size=sensitive_ws,
+                            evalue=sensitive_evalue
                         )
+                        if hit:
+                            new_hits[(self.center_id, sid)] = BlastHit(
+                                query_id=hit.subject_id,
+                                subject_id=hit.query_id,
+                                query_start=hit.subject_start,
+                                query_end=hit.subject_end,
+                                subject_start=hit.query_start,
+                                subject_end=hit.query_end,
+                                query_seq=hit.subject_seq,
+                                subject_seq=hit.query_seq,
+                                evalue=hit.evalue,
+                                bitscore=hit.bitscore,
+                                identity=hit.identity
+                            )
 
-            if not new_hits:
+            if not new_hits and not nw_aligned:
                 if verbose:
                     print(f"  No improved hits found, stopping refinement")
                 break
-
-            # Rebuild MSA: run full all-vs-all BLAST but replace hits for
-            # the poor sequences with the consensus-based hits
-            # Simpler approach: rebuild from the existing good alignment
-            # by re-extending the poor sequences with new hits
-
-            # Get the consensus as a Sequence for alignment extension
-            consensus_as_seq = Sequence(
-                id='_consensus_',
-                description='consensus',
-                seq=consensus_seq
-            )
 
             # Build new pairwise alignments for poor sequences against consensus
             refined_seqs = list(good_seqs)  # Start with good sequences as-is
 
             for sid in poor_ids:
-                hit_key = (self.center_id, sid)
-                if hit_key in new_hits:
-                    hit = new_hits[hit_key]
-                    # Extend the pairwise alignment (consensus as query, poor seq as subject)
+                if sid in nw_aligned:
+                    cons_aln, seq_aln = nw_aligned[sid]
+                    aligned_seq = self._map_to_msa_columns(
+                        seq_aln, cons_aln, good_alignment
+                    )
+                    if verbose:
+                        n_before = len(poor_seq_map[sid].seq) - len(poor_seq_map[sid].seq.lstrip('-'))
+                        n_after = len(aligned_seq) - len(aligned_seq.lstrip('-'))
+                        print(f"    {sid}: NW realign, leading gaps {n_before} -> {n_after}")
+                    refined_seqs.append(Sequence(
+                        id=sid,
+                        description=poor_seq_map[sid].description,
+                        seq=aligned_seq
+                    ))
+                elif (self.center_id, sid) in new_hits:
+                    hit = new_hits[(self.center_id, sid)]
                     pair = extend_pairwise_alignment(
                         hit, consensus_seq, poor_seq_map[sid].seq
                     )
-                    # The aligned subject is our refined sequence, but it's aligned
-                    # to the consensus which has the same coordinate space as the
-                    # good alignment. We need to insert it at the right position.
-
-                    # Map the consensus-aligned sequence back to the MSA columns
                     aligned_seq = self._map_to_msa_columns(
                         pair.seq2_aligned, pair.seq1_aligned, good_alignment
                     )
-
                     refined_seqs.append(Sequence(
                         id=sid,
                         description=poor_seq_map[sid].description,
                         seq=aligned_seq
                     ))
                 else:
-                    # Keep original if no new hit
                     orig = next((s for s in current.sequences if s.id == sid), None)
                     if orig:
                         refined_seqs.append(orig)
