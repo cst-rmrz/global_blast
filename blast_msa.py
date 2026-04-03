@@ -323,6 +323,10 @@ Blastn scoring (--reward / --penalty):
             print(f"  Gap open: {gap_open}")
             print(f"  Gap extend: {gap_extend}")
             print(f"  Word size: {word_size}")
+            if reward is not None:
+                print(f"  Reward: {reward}")
+            if penalty is not None:
+                print(f"  Penalty: {penalty}")
             print()
         
         with BlastRunner(seq_type) as runner:
@@ -337,7 +341,9 @@ Blastn scoring (--reward / --penalty):
                     evalue=evalue,
                     verbose=args.verbose,
                     threads=args.threads,
-                    max_hsps=args.max_hsps
+                    max_hsps=args.max_hsps,
+                    reward=reward,
+                    penalty=penalty
                 )
                 # Derive single-hit dict for center selection (best bitscore per pair)
                 hits = {k: max(v, key=lambda h: h.bitscore)

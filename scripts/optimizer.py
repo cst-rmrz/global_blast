@@ -504,7 +504,9 @@ class ParameterOptimizer:
                     evalue=evalue,
                     verbose=verbose,
                     threads=threads,
-                    max_hsps=max_hsps
+                    max_hsps=max_hsps,
+                    reward=best_params.get('reward'),
+                    penalty=best_params.get('penalty')
                 )
                 hits = {k: max(v, key=lambda h: h.bitscore) for k, v in multi_hits.items()}
             else:

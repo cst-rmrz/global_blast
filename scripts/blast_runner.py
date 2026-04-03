@@ -498,7 +498,9 @@ class BlastRunner:
                                    word_size: int = None, evalue: float = 1e-5,
                                    verbose: bool = False,
                                    threads: int = None,
-                                   max_hsps: int = 10) -> Dict[Tuple[str, str], List[BlastHit]]:
+                                   max_hsps: int = 10,
+                                   reward: int = None,
+                                   penalty: int = None) -> Dict[Tuple[str, str], List[BlastHit]]:
         """
         Run all-vs-all BLAST and return ALL HSPs per (query, subject) pair.
 
@@ -542,6 +544,10 @@ class BlastRunner:
             '-max_hsps', str(max_hsps),
             '-num_threads', str(threads)
         ]
+        if reward is not None:
+            cmd += ['-reward', str(reward)]
+        if penalty is not None:
+            cmd += ['-penalty', str(penalty)]
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0 and 'error' in result.stderr.lower():
