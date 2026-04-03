@@ -63,7 +63,7 @@ def load_params(params_file: Path) -> Dict[str, Any]:
         'optimize_metric': 'sp_score',
         # Extension parameters
         'extend_termini': True,
-        'terminal_gap_penalty': 0,
+        'terminal_gap_penalty': 0.0,
         # Refinement parameters
         'refine': False,
         'refine_iterations': 3,
@@ -100,13 +100,13 @@ def load_params(params_file: Path) -> Dict[str, Any]:
                        'gap_extend_protein', 'gap_extend_nucleotide',
                        'word_size_protein', 'word_size_nucleotide',
                        'reward_nucleotide', 'penalty_nucleotide',
-                       'terminal_gap_penalty', 'wrap_width']:
+                       'wrap_width']:
                 params[key] = int(value)
             elif key == 'evalue':
                 params[key] = float(value)
             elif key in ('extend_termini', 'refine'):
                 params[key] = value.lower() in ('true', 'yes', '1')
-            elif key == 'coverage_threshold':
+            elif key in ('coverage_threshold', 'terminal_gap_penalty'):
                 params[key] = float(value)
             elif key == 'refine_iterations':
                 params[key] = int(value)
@@ -275,6 +275,7 @@ Blastn scoring (--reward / --penalty):
     refine = args.refine or params['refine']
     refine_iterations = (args.refine_iterations if args.refine_iterations is not None
                         else params['refine_iterations'])
+    leading_gap_penalty = params['terminal_gap_penalty']
 
     # Run alignment
     if args.optimize:
@@ -388,7 +389,8 @@ Blastn scoring (--reward / --penalty):
         alignment = refine_aligner.refine_msa(
             alignment,
             max_iterations=refine_iterations,
-            verbose=args.verbose
+            verbose=args.verbose,
+            leading_gap_penalty=leading_gap_penalty
         )
 
         if args.verbose:

@@ -77,8 +77,12 @@ coverage_threshold = 0.5
 # Extend alignments to sequence termini
 extend_termini = true
 
-# Penalty for terminal gaps (0 = free terminal gaps, typical for MSA)
-terminal_gap_penalty = 0
+# Leading gap penalty for refinement (float, default 0 = disabled)
+# Deducts this many identity-percent-points per leading gap column from a
+# sequence's effective identity score, making it more likely to be flagged
+# for realignment. E.g. 0.5 means 10 leading gaps subtracts 5% identity.
+# Useful when misaligned sequences can be rescued by shifting leading gaps.
+terminal_gap_penalty = 0.0
 
 # =============================================================================
 # Output Parameters

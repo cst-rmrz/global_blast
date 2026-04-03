@@ -651,19 +651,25 @@ class CenterStarAligner:
 
     def refine_msa(self, alignment: Alignment,
                    max_iterations: int = 3,
-                   verbose: bool = False) -> Alignment:
+                   verbose: bool = False,
+                   leading_gap_penalty: float = 0.0) -> Alignment:
         """
         Iterative refinement: detect poorly-aligned sequences, remove them,
         build consensus from remaining, re-BLAST against consensus, reinsert.
 
         Repeats until no sequences are flagged or max_iterations reached.
+
+        leading_gap_penalty: passed to compute_per_sequence_identity to penalize
+        sequences with leading gaps, making them more likely to be flagged for
+        realignment (identity-percent-points per leading gap column).
         """
         import numpy as np
 
         current = alignment
 
         for iteration in range(max_iterations):
-            scores = compute_per_sequence_identity(current)
+            scores = compute_per_sequence_identity(current,
+                                                   leading_gap_penalty=leading_gap_penalty)
             if not scores:
                 break
 
@@ -865,12 +871,16 @@ def compute_hit_coverage(hit: BlastHit, query_len: int, subject_len: int) -> flo
     return hit.query_len_aligned / query_len
 
 
-def compute_per_sequence_identity(alignment: Alignment) -> Dict[str, float]:
+def compute_per_sequence_identity(alignment: Alignment,
+                                   leading_gap_penalty: float = 0.0) -> Dict[str, float]:
     """
     Compute average pairwise percent identity for each sequence against all others.
 
     Returns dict mapping seq_id to its average identity (0-100).
     Useful for identifying poorly-aligned sequences.
+
+    leading_gap_penalty: identity-percent-points deducted per leading gap column.
+    E.g. 0.5 means 10 leading gaps → −5% effective identity. Clamped to 0.
     """
     if not alignment.is_valid() or alignment.n_seqs < 2:
         return {}
@@ -901,7 +911,14 @@ def compute_per_sequence_identity(alignment: Alignment) -> Dict[str, float]:
                 total_identity += matches / aligned_positions
                 n_pairs += 1
 
-        scores[sequences[i].id] = (total_identity / n_pairs * 100) if n_pairs > 0 else 0.0
+        raw = (total_identity / n_pairs * 100) if n_pairs > 0 else 0.0
+
+        if leading_gap_penalty > 0.0:
+            seq = sequences[i].seq
+            leading_gaps = len(seq) - len(seq.lstrip('-'))
+            raw = max(0.0, raw - leading_gaps * leading_gap_penalty)
+
+        scores[sequences[i].id] = raw
 
     return scores
 
