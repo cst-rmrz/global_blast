@@ -183,6 +183,12 @@ Output formats:
     parser.add_argument('--low-coverage-hsp', type=int, default=1,
                        help='Number of HSPs to search during --iterative sub-group '
                             'BLAST and bridge alignment (default: 1)')
+    parser.add_argument('--no-nw-subgroup', action='store_true',
+                       help='Use BLAST instead of Needleman-Wunsch for --iterative '
+                            'sub-group pairwise alignment (default: NW)')
+    parser.add_argument('--nw-terminals', type=float, default=0.5,
+                       help='Coverage threshold below which terminal overhangs are '
+                            'NW-aligned instead of gap-padded (default: 0.5, set 0 to disable)')
     
     # Output options
     parser.add_argument('-v', '--verbose', action='store_true',
@@ -369,6 +375,8 @@ Output formats:
             max_iterations=args.iterative_max_iter,
             coverage_threshold=coverage_threshold,
             max_hsps=args.low_coverage_hsp,
+            nw_subgroup=not args.no_nw_subgroup,
+            nw_terminals=args.nw_terminals,
             verbose=args.verbose
         )
 

@@ -29,53 +29,130 @@ class AlignedPair:
     seq2_original: str
 
 
-def extend_pairwise_alignment(hit: BlastHit, 
-                              query_seq: str, 
-                              subject_seq: str) -> AlignedPair:
+def needleman_wunsch(seq1: str, seq2: str,
+                     match: int = 2, mismatch: int = -1,
+                     gap: int = -2) -> Tuple[str, str]:
+    """
+    Global pairwise alignment via Needleman-Wunsch dynamic programming.
+
+    Used when BLAST coverage is too low to build a reliable alignment —
+    typically for highly divergent sequences or sequences with large
+    internal insertions. Distributes gaps throughout rather than
+    end-padding like terminal extension does.
+
+    Returns two aligned strings of equal length (with '-' for gaps).
+    """
+    n, m = len(seq1), len(seq2)
+
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = i * gap
+    for j in range(m + 1):
+        dp[0][j] = j * gap
+
+    for i in range(1, n + 1):
+        row_prev = dp[i - 1]
+        row_curr = dp[i]
+        s1i = seq1[i - 1].upper()
+        for j in range(1, m + 1):
+            diag = row_prev[j - 1] + (match if s1i == seq2[j - 1].upper() else mismatch)
+            up   = row_prev[j] + gap
+            left = row_curr[j - 1] + gap
+            row_curr[j] = diag if diag >= up and diag >= left else (up if up >= left else left)
+
+    aligned1: List[str] = []
+    aligned2: List[str] = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0:
+            s1i = seq1[i - 1].upper()
+            diag_score = dp[i - 1][j - 1] + (match if s1i == seq2[j - 1].upper() else mismatch)
+            if dp[i][j] == diag_score:
+                aligned1.append(seq1[i - 1])
+                aligned2.append(seq2[j - 1])
+                i -= 1
+                j -= 1
+                continue
+        if i > 0 and (j == 0 or dp[i][j] == dp[i - 1][j] + gap):
+            aligned1.append(seq1[i - 1])
+            aligned2.append('-')
+            i -= 1
+        else:
+            aligned1.append('-')
+            aligned2.append(seq2[j - 1])
+            j -= 1
+
+    aligned1.reverse()
+    aligned2.reverse()
+    return ''.join(aligned1), ''.join(aligned2)
+
+
+def nw_aligned_pair(seq1: Sequence, seq2: Sequence) -> AlignedPair:
+    """Wrap needleman_wunsch() as an AlignedPair (same interface as extend_pairwise_alignment)."""
+    a1, a2 = needleman_wunsch(seq1.seq, seq2.seq)
+    return AlignedPair(
+        seq1_id=seq1.id, seq2_id=seq2.id,
+        seq1_aligned=a1, seq2_aligned=a2,
+        seq1_original=seq1.seq, seq2_original=seq2.seq
+    )
+
+
+def extend_pairwise_alignment(hit: BlastHit,
+                              query_seq: str,
+                              subject_seq: str,
+                              nw_threshold: float = 0.0) -> AlignedPair:
     """
     Extend a local BLAST alignment to cover full sequence lengths.
-    
+
     Strategy:
-    1. Add unaligned N-terminal regions (with gaps in the other sequence)
+    1. Handle unaligned N-terminal regions
     2. Keep the BLAST-aligned middle region
-    3. Add unaligned C-terminal regions (with gaps in the other sequence)
-    
-    Terminal gaps are "free" in typical MSA scoring, so this doesn't
-    penalize sequences for length differences.
+    3. Handle unaligned C-terminal regions
+
+    When nw_threshold > 0 and BLAST coverage of the query is below that
+    fraction, terminal overhangs are aligned with Needleman-Wunsch instead
+    of raw gap-padding. This distributes gaps within the tails rather than
+    stacking them at the ends, which improves alignment quality for
+    divergent sequences.
     """
-    # Get the aligned portions from BLAST
     query_aln = hit.query_seq
     subject_aln = hit.subject_seq
-    
-    # N-terminal extensions
-    # Query starts at hit.query_start (1-based), so we need positions 0 to query_start-2
+
     query_n_term = query_seq[:hit.query_start - 1]
     subject_n_term = subject_seq[:hit.subject_start - 1]
-    
-    # C-terminal extensions  
-    # Query ends at hit.query_end (1-based), so we need positions query_end to end
     query_c_term = query_seq[hit.query_end:]
     subject_c_term = subject_seq[hit.subject_end:]
-    
-    # Build extended alignment
-    # N-terminal: align the overhangs
-    n_term_query, n_term_subject = _extend_terminal(
-        query_n_term, subject_n_term, is_n_terminal=True
-    )
-    
-    # C-terminal: align the overhangs
-    c_term_query, c_term_subject = _extend_terminal(
-        query_c_term, subject_c_term, is_n_terminal=False
-    )
-    
-    # Concatenate all parts
+
+    # Decide whether to use NW for terminal regions
+    use_nw = False
+    if nw_threshold > 0 and len(query_seq) > 0:
+        coverage = hit.query_len_aligned / len(query_seq)
+        use_nw = coverage < nw_threshold
+
+    if use_nw:
+        if query_n_term and subject_n_term:
+            n_term_query, n_term_subject = needleman_wunsch(query_n_term, subject_n_term)
+        else:
+            n_term_query, n_term_subject = _extend_terminal(
+                query_n_term, subject_n_term, is_n_terminal=True)
+
+        if query_c_term and subject_c_term:
+            c_term_query, c_term_subject = needleman_wunsch(query_c_term, subject_c_term)
+        else:
+            c_term_query, c_term_subject = _extend_terminal(
+                query_c_term, subject_c_term, is_n_terminal=False)
+    else:
+        n_term_query, n_term_subject = _extend_terminal(
+            query_n_term, subject_n_term, is_n_terminal=True)
+        c_term_query, c_term_subject = _extend_terminal(
+            query_c_term, subject_c_term, is_n_terminal=False)
+
     full_query = n_term_query + query_aln + c_term_query
     full_subject = n_term_subject + subject_aln + c_term_subject
-    
-    # Sanity check
+
     assert len(full_query) == len(full_subject), \
         f"Alignment length mismatch: {len(full_query)} vs {len(full_subject)}"
-    
+
     return AlignedPair(
         seq1_id=hit.query_id,
         seq2_id=hit.subject_id,
@@ -161,6 +238,7 @@ class CenterStarAligner:
     
     def build_msa(self, hits: Dict[Tuple[str, str], BlastHit],
                   center_id: Optional[str] = None,
+                  nw_terminals: float = 0.0,
                   verbose: bool = False) -> Alignment:
         """
         Build MSA from pairwise BLAST hits.
@@ -219,7 +297,8 @@ class CenterStarAligner:
                         identity=hit.identity
                     )
                 
-                pair = extend_pairwise_alignment(hit, center_seq.seq, other_seq.seq)
+                pair = extend_pairwise_alignment(hit, center_seq.seq, other_seq.seq,
+                                                nw_threshold=nw_terminals)
             else:
                 # No hit found - create fallback alignment
                 pair = create_alignment_no_hit(center_seq, other_seq)
@@ -566,17 +645,24 @@ class CenterStarAligner:
                          max_iterations: int = 5,
                          coverage_threshold: float = 0.5,
                          max_hsps: int = 1,
+                         nw_subgroup: bool = True,
+                         nw_terminals: float = 0.0,
                          verbose: bool = False) -> Alignment:
         """
         Iterative center-star refinement for poorly-aligned sequences.
 
         Each iteration:
           1. Find sequences below identity_threshold (within-subgroup check)
-          2. Build a new center-star MSA from only those sequences
-          3. Merge the sub-MSA back into the main alignment via bridge alignment
+          2. Build a new center-star MSA from only those sequences using NW
+             pairwise alignments (when nw_subgroup=True) or BLAST
+          3. Merge the sub-MSA back into the main alignment via NW bridge
           4. Repeat with sequences still below threshold within their sub-group
 
-        Stops when the poor set stops shrinking or drops below 2 sequences.
+        nw_subgroup: use Needleman-Wunsch for sub-group pairwise alignment
+                     instead of BLAST (option 3)
+        nw_terminals: coverage threshold below which terminal overhangs in
+                      the main build_msa step are NW-aligned instead of
+                      gap-padded (option 2); 0 disables
         """
         scores = compute_per_sequence_identity(alignment)
         current_poor = {sid for sid, s in scores.items() if s < identity_threshold}
@@ -593,26 +679,58 @@ class CenterStarAligner:
 
             if verbose:
                 print(f"  Iteration {iteration + 1}: sub-aligning "
-                      f"{len(current_poor)} sequences...")
+                      f"{len(current_poor)} sequences"
+                      + (" (NW)" if nw_subgroup else " (BLAST)") + "...")
 
             sub_seqs = [self.sequences[sid] for sid in current_poor
                         if sid in self.sequences]
 
-            with BlastRunner(self.seq_type) as runner:
-                sub_hits = runner.run_all_pairwise(
-                    sub_seqs,
-                    gap_open=gap_open,
-                    gap_extend=gap_extend,
-                    word_size=word_size,
-                    evalue=evalue,
-                    verbose=False,
-                    coverage_threshold=coverage_threshold,
-                    max_hsps=max_hsps
-                )
+            if nw_subgroup:
+                # Build all pairwise NW alignments directly — no BLAST needed
+                sub_hits = {}
+                for i, s1 in enumerate(sub_seqs):
+                    for s2 in sub_seqs[i + 1:]:
+                        pair = nw_aligned_pair(s1, s2)
+                        # Store as a synthetic BlastHit covering the full sequences
+                        hit_fwd = BlastHit(
+                            query_id=s1.id, subject_id=s2.id,
+                            query_start=1, query_end=len(s1.seq),
+                            subject_start=1, subject_end=len(s2.seq),
+                            query_seq=pair.seq1_aligned.replace('-', ''),
+                            subject_seq=pair.seq2_aligned.replace('-', ''),
+                            evalue=0.0, bitscore=1.0,
+                            identity=sum(a == b for a, b in zip(
+                                pair.seq1_aligned, pair.seq2_aligned)
+                                if a != '-' and b != '-') /
+                                max(1, sum(a != '-' or b != '-' for a, b in zip(
+                                    pair.seq1_aligned, pair.seq2_aligned))) * 100
+                        )
+                        sub_hits[(s1.id, s2.id)] = hit_fwd
+                        sub_hits[(s2.id, s1.id)] = BlastHit(
+                            query_id=s2.id, subject_id=s1.id,
+                            query_start=1, query_end=len(s2.seq),
+                            subject_start=1, subject_end=len(s1.seq),
+                            query_seq=pair.seq2_aligned.replace('-', ''),
+                            subject_seq=pair.seq1_aligned.replace('-', ''),
+                            evalue=0.0, bitscore=1.0,
+                            identity=hit_fwd.identity
+                        )
+            else:
+                with BlastRunner(self.seq_type) as runner:
+                    sub_hits = runner.run_all_pairwise(
+                        sub_seqs,
+                        gap_open=gap_open,
+                        gap_extend=gap_extend,
+                        word_size=word_size,
+                        evalue=evalue,
+                        verbose=False,
+                        coverage_threshold=coverage_threshold,
+                        max_hsps=max_hsps
+                    )
 
             # Build sub-MSA with auto-selected center
             sub_aligner = CenterStarAligner(sub_seqs, self.seq_type)
-            sub_msa = sub_aligner.build_msa(sub_hits)
+            sub_msa = sub_aligner.build_msa(sub_hits, nw_terminals=nw_terminals)
 
             sub_scores = compute_per_sequence_identity(sub_msa)
             still_poor = {sid for sid, s in sub_scores.items()
@@ -636,7 +754,8 @@ class CenterStarAligner:
 
                 for candidate_id in sorted(current_poor):
                     cand_aligner = CenterStarAligner(sub_seqs, self.seq_type)
-                    cand_msa = cand_aligner.build_msa(sub_hits, center_id=candidate_id)
+                    cand_msa = cand_aligner.build_msa(sub_hits, center_id=candidate_id,
+                                                        nw_terminals=nw_terminals)
                     cand_scores = compute_per_sequence_identity(cand_msa)
                     cand_still_poor = {sid for sid, s in cand_scores.items()
                                        if s < identity_threshold}
@@ -682,7 +801,7 @@ class CenterStarAligner:
 
           1. Build consensus from the well-aligned (non-poor) sequences in main
           2. Build consensus from the sub-MSA
-          3. BLAST sub-consensus against main-consensus (bridge)
+          3. Needleman-Wunsch global alignment of sub-consensus vs main-consensus
           4. For each poor sequence: map sub-MSA columns → sub-consensus positions
              → main-consensus positions → main-MSA columns (double mapping)
           5. Replace poor sequences in main alignment with remapped versions
@@ -702,28 +821,18 @@ class CenterStarAligner:
                 print("    Could not build consensus for bridge, skipping merge")
             return main_alignment
 
-        # Bridge: BLAST sub-consensus (query) against main-consensus (subject)
-        sub_cons_seq = Sequence(id='sub_consensus', description='', seq=sub_consensus)
-        if verbose and max_hsps > 1:
-            print(f"    Bridge BLAST (sub-consensus vs main-consensus, max_hsps={max_hsps}):")
-        with BlastRunner(self.seq_type) as runner:
-            bridge_hit = runner.run_vs_consensus(
-                sub_cons_seq, main_consensus,
-                gap_open=5 if self.seq_type != SeqType.PROTEIN else 11,
-                gap_extend=2 if self.seq_type != SeqType.PROTEIN else 1,
-                word_size=7 if self.seq_type != SeqType.PROTEIN else 2,
-                evalue=1e-3,
-                max_hsps=max_hsps,
-                verbose=verbose
-            )
+        # Bridge: global NW alignment of sub-consensus vs main-consensus
+        if verbose:
+            print(f"    Bridge NW (sub-consensus {len(sub_consensus)}bp "
+                  f"vs main-consensus {len(main_consensus)}bp)")
+        sub_cons_aln, main_cons_aln = needleman_wunsch(sub_consensus, main_consensus)
 
-        if bridge_hit is None:
-            if verbose:
-                print("    Bridge alignment failed, keeping original positions")
-            return main_alignment
-
-        # Extend bridge to full length: seq1=sub-consensus, seq2=main-consensus
-        bridge_pair = extend_pairwise_alignment(bridge_hit, sub_consensus, main_consensus)
+        # Wrap as an AlignedPair so downstream mapping code is unchanged
+        bridge_pair = AlignedPair(
+            seq1_id='sub_consensus', seq2_id='main_consensus',
+            seq1_aligned=sub_cons_aln, seq2_aligned=main_cons_aln,
+            seq1_original=sub_consensus, seq2_original=main_consensus
+        )
 
         # Precompute: for each poor sequence, its characters at sub-consensus positions
         sub_msa_seqs = {s.id: s.seq for s in sub_msa.sequences}
