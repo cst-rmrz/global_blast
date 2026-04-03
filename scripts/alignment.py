@@ -652,16 +652,17 @@ class CenterStarAligner:
     def refine_msa(self, alignment: Alignment,
                    max_iterations: int = 3,
                    verbose: bool = False,
-                   leading_gap_penalty: float = 0.0) -> Alignment:
+                   leading_gap_penalty: float = 0.0,
+                   max_leading_gaps: int = 0) -> Alignment:
         """
         Iterative refinement: detect poorly-aligned sequences, remove them,
         build consensus from remaining, re-BLAST against consensus, reinsert.
 
         Repeats until no sequences are flagged or max_iterations reached.
 
-        leading_gap_penalty: passed to compute_per_sequence_identity to penalize
-        sequences with leading gaps, making them more likely to be flagged for
-        realignment (identity-percent-points per leading gap column).
+        leading_gap_penalty: identity-percent-points deducted per leading gap.
+        max_leading_gaps: if > 0, any sequence with more leading gaps than this
+            is flagged for realignment regardless of its identity score.
         """
         import numpy as np
 
@@ -681,6 +682,13 @@ class CenterStarAligner:
             threshold = mean_score - 1.5 * std_score
             poor_ids = [sid for sid, score in scores.items()
                         if score < threshold and score < mean_score]
+
+            # Also flag sequences that exceed the leading-gap hard limit
+            if max_leading_gaps > 0:
+                for seq in current.sequences:
+                    n_leading = len(seq.seq) - len(seq.seq.lstrip('-'))
+                    if n_leading > max_leading_gaps and seq.id not in poor_ids:
+                        poor_ids.append(seq.id)
 
             if not poor_ids:
                 if verbose:

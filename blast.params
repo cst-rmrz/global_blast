@@ -81,8 +81,13 @@ extend_termini = true
 # Deducts this many identity-percent-points per leading gap column from a
 # sequence's effective identity score, making it more likely to be flagged
 # for realignment. E.g. 0.5 means 10 leading gaps subtracts 5% identity.
-# Useful when misaligned sequences can be rescued by shifting leading gaps.
 terminal_gap_penalty = 0.0
+
+# Maximum leading gaps allowed before a sequence is forced into refinement
+# (int, default 0 = disabled). Any sequence with more leading gap columns
+# than this is flagged for realignment regardless of its identity score.
+# E.g. max_leading_gaps = 5 will realign any sequence starting with 6+ gaps.
+max_leading_gaps = 0
 
 # =============================================================================
 # Output Parameters

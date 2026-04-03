@@ -64,6 +64,7 @@ def load_params(params_file: Path) -> Dict[str, Any]:
         # Extension parameters
         'extend_termini': True,
         'terminal_gap_penalty': 0.0,
+        'max_leading_gaps': 0,
         # Refinement parameters
         'refine': False,
         'refine_iterations': 3,
@@ -108,6 +109,8 @@ def load_params(params_file: Path) -> Dict[str, Any]:
                 params[key] = value.lower() in ('true', 'yes', '1')
             elif key in ('coverage_threshold', 'terminal_gap_penalty'):
                 params[key] = float(value)
+            elif key == 'max_leading_gaps':
+                params[key] = int(value)
             elif key == 'refine_iterations':
                 params[key] = int(value)
             elif key.startswith('optimize_') and key != 'optimize_metric':
@@ -276,6 +279,7 @@ Blastn scoring (--reward / --penalty):
     refine_iterations = (args.refine_iterations if args.refine_iterations is not None
                         else params['refine_iterations'])
     leading_gap_penalty = params['terminal_gap_penalty']
+    max_leading_gaps = params['max_leading_gaps']
 
     # Run alignment
     if args.optimize:
@@ -390,7 +394,8 @@ Blastn scoring (--reward / --penalty):
             alignment,
             max_iterations=refine_iterations,
             verbose=args.verbose,
-            leading_gap_penalty=leading_gap_penalty
+            leading_gap_penalty=leading_gap_penalty,
+            max_leading_gaps=max_leading_gaps
         )
 
         if args.verbose:
