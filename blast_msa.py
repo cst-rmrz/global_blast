@@ -169,6 +169,8 @@ Output formats:
                        help='Maximum refinement iterations (default: 3)')
     parser.add_argument('--coverage-threshold', type=float, default=None,
                        help='Minimum alignment coverage to accept a BLAST hit (default: 0.5)')
+    parser.add_argument('--no-coverage-guard', action='store_true',
+                       help='Disable coverage guard (equivalent to --coverage-threshold 0)')
     
     # Output options
     parser.add_argument('-v', '--verbose', action='store_true',
@@ -239,7 +241,8 @@ Output formats:
     
     evalue = args.evalue if args.evalue is not None else params['evalue']
 
-    coverage_threshold = (args.coverage_threshold if args.coverage_threshold is not None
+    coverage_threshold = (0.0 if args.no_coverage_guard
+                         else args.coverage_threshold if args.coverage_threshold is not None
                          else params['coverage_threshold'])
     refine = args.refine or params['refine']
     refine_iterations = (args.refine_iterations if args.refine_iterations is not None

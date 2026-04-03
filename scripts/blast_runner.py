@@ -575,23 +575,55 @@ class BlastRunner:
                           gap_open: int = 5, gap_extend: int = 2,
                           word_size: int = 7, evalue: float = 1e-3) -> Optional[BlastHit]:
         """
-        BLAST a single sequence against a consensus string.
+        BLAST a single sequence against a consensus string, using reciprocal alignment.
 
-        Uses sensitive parameters by default since this is for realigning
-        divergent sequences during iterative refinement.
+        Runs both directions (query→consensus and consensus→query) and returns
+        the hit with higher percent identity. The reverse hit is flipped so the
+        return value always has query_id=query.id, subject_id='consensus'.
         """
-        query_path = Path(self.temp_dir) / 'refine_query.fasta'
-        subject_path = Path(self.temp_dir) / 'refine_consensus.fasta'
+        import uuid
+        pair_id = uuid.uuid4().hex[:8]
+        query_path = Path(self.temp_dir) / f'refine_query_{pair_id}.fasta'
+        subject_path = Path(self.temp_dir) / f'refine_consensus_{pair_id}.fasta'
 
         with open(query_path, 'w') as f:
             f.write(f">{query.id}\n{query.seq}\n")
         with open(subject_path, 'w') as f:
             f.write(f">consensus\n{consensus_seq}\n")
 
-        return _execute_blast(
+        fwd = _execute_blast(
             query_path, subject_path, self.blast_cmd,
             gap_open, gap_extend, word_size, evalue, max_hsps=3
         )
+
+        # Reciprocal: consensus as query, sequence as subject
+        rev_raw = _execute_blast(
+            subject_path, query_path, self.blast_cmd,
+            gap_open, gap_extend, word_size, evalue, max_hsps=3
+        )
+
+        if rev_raw is None:
+            return fwd
+
+        # Flip rev_raw so orientation matches fwd (query=sequence, subject=consensus)
+        rev = BlastHit(
+            query_id=rev_raw.subject_id,
+            subject_id=rev_raw.query_id,
+            query_start=rev_raw.subject_start,
+            query_end=rev_raw.subject_end,
+            subject_start=rev_raw.query_start,
+            subject_end=rev_raw.query_end,
+            query_seq=rev_raw.subject_seq,
+            subject_seq=rev_raw.query_seq,
+            evalue=rev_raw.evalue,
+            bitscore=rev_raw.bitscore,
+            identity=rev_raw.identity
+        )
+
+        if fwd is None:
+            return rev
+
+        return fwd if fwd.identity >= rev.identity else rev
 
 
 def compute_pairwise_scores(hits: Dict[Tuple[str, str], BlastHit],
