@@ -68,6 +68,9 @@ def load_params(params_file: Path) -> Dict[str, Any]:
         'refine': False,
         'refine_iterations': 3,
         'coverage_threshold': 0.5,
+        # Nucleotide scoring (blastn only)
+        'reward_nucleotide': None,
+        'penalty_nucleotide': None,
         # Output parameters
         'default_format': 'fasta',
         'wrap_width': 80,
@@ -95,7 +98,8 @@ def load_params(params_file: Path) -> Dict[str, Any]:
             # Parse based on expected type
             if key in ['gap_open_protein', 'gap_open_nucleotide',
                        'gap_extend_protein', 'gap_extend_nucleotide',
-                       'word_size_protein', 'word_size_nucleotide', 
+                       'word_size_protein', 'word_size_nucleotide',
+                       'reward_nucleotide', 'penalty_nucleotide',
                        'terminal_gap_penalty', 'wrap_width']:
                 params[key] = int(value)
             elif key == 'evalue':
@@ -125,6 +129,8 @@ Examples:
   %(prog)s sequences.fasta -o aligned.fasta --optimize
   %(prog)s proteins.faa -o aligned.aln -f clustal
   %(prog)s sequences.fasta -o aligned.nex -f nexus --optimize --metric percent_identity
+  %(prog)s sequences.fasta -o aligned.fasta --synteny --reward 2 --penalty -3
+  %(prog)s sequences.fasta -o aligned.fasta --params my_seqs.params --synteny
 
 Output formats:
   fasta          FASTA format (default)
@@ -132,6 +138,12 @@ Output formats:
   phylip-relaxed Phylip relaxed format (longer names)
   clustal        Clustal format with conservation marks
   nexus          NEXUS format for phylogenetics software
+
+Blastn scoring (--reward / --penalty):
+  Valid (reward, penalty) pairs: (1,-1), (1,-2), (2,-3), (2,-5), (4,-5)
+  Each pair constrains valid --gap-open / --gap-extend combinations.
+  Set reward_nucleotide / penalty_nucleotide in a .params file to avoid
+  repeating these flags each run.
         """
     )
     
@@ -152,6 +164,10 @@ Output formats:
                        help='Gap extension penalty')
     parser.add_argument('--word-size', type=int, default=None,
                        help='Word size for BLAST seeding')
+    parser.add_argument('--reward', type=int, default=None,
+                       help='Nucleotide match reward (blastn only, e.g. 1, 2, 4)')
+    parser.add_argument('--penalty', type=int, default=None,
+                       help='Nucleotide mismatch penalty (blastn only, negative, e.g. -1, -2, -3)')
     parser.add_argument('--evalue', type=float, default=None,
                        help='E-value threshold')
     
@@ -243,9 +259,14 @@ Output formats:
     
     gap_extend = args.gap_extend
     if gap_extend is None:
-        gap_extend = (params['gap_extend_protein'] if is_protein 
+        gap_extend = (params['gap_extend_protein'] if is_protein
                      else params['gap_extend_nucleotide'])
-    
+
+    reward = args.reward if args.reward is not None else (
+        None if is_protein else params.get('reward_nucleotide'))
+    penalty = args.penalty if args.penalty is not None else (
+        None if is_protein else params.get('penalty_nucleotide'))
+
     evalue = args.evalue if args.evalue is not None else params['evalue']
 
     coverage_threshold = (0.0 if args.no_coverage_guard
@@ -330,7 +351,9 @@ Output formats:
                     evalue=evalue,
                     verbose=args.verbose,
                     threads=args.threads,
-                    coverage_threshold=coverage_threshold
+                    coverage_threshold=coverage_threshold,
+                    reward=reward,
+                    penalty=penalty
                 )
                 multi_hits = None
 
