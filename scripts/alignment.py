@@ -463,7 +463,15 @@ class CenterStarAligner:
         
         # Use the first aligned center as starting point
         master_center = list(all_center_aligned[0])
-        master_mapping = list(range(len(master_center)))  # Maps master positions to original
+        # Maps master positions to ungapped center positions (-1 for gaps)
+        ungapped_pos = 0
+        master_mapping = []
+        for ch in master_center:
+            if ch == '-':
+                master_mapping.append(-1)
+            else:
+                master_mapping.append(ungapped_pos)
+                ungapped_pos += 1
         
         # For each other alignment, find gaps that need to be inserted into master
         for i, pair in enumerate(pairwise.values()):
@@ -511,50 +519,98 @@ class CenterStarAligner:
                           new_center: str) -> Tuple[List[str], List[int]]:
         """
         Reconcile a new center alignment with the master.
-        
-        Inserts gaps into master where new_center has gaps that master doesn't.
-        Returns updated master and mapping.
+
+        Uses position-aware merging: parse both strings into (gap_run, char)
+        segments keyed by ungapped position, then for each ungapped center
+        character take the MAX gap run from either representation.
+
+        This is robust to BLAST inserting internal gaps at different positions
+        in different pairwise alignments. The old character-walking approach
+        assumed non-gap characters in both strings always correspond to the
+        same underlying position, which fails when BLAST gap patterns differ
+        between pairs — causing downstream NW-produced leading gaps to be
+        shifted to wrong columns.
         """
+        # Parse master into segments: (gap_count_before, char, master_map_value)
+        master_segs = []
+        pending_gaps = 0
+        for ch, pos in zip(master, master_map):
+            if pos == -1:
+                pending_gaps += 1
+            else:
+                master_segs.append((pending_gaps, ch, pos))
+                pending_gaps = 0
+        trailing_gaps_master = pending_gaps
+
+        # Parse new_center into segments: (gap_count_before, char)
+        new_segs = []
+        pending_gaps = 0
+        for ch in new_center:
+            if ch == '-':
+                pending_gaps += 1
+            else:
+                new_segs.append((pending_gaps, ch))
+                pending_gaps = 0
+        trailing_gaps_new = pending_gaps
+
+        # Both must represent the same underlying center sequence
+        if len(master_segs) != len(new_segs):
+            # Length mismatch — fall back to the original character-walking approach
+            # (should not happen with correct input)
+            return self._reconcile_center_fallback(master, master_map, new_center)
+
+        result: List[str] = []
+        result_map: List[int] = []
+
+        for (mg, mc, mpos), (ng, _nc) in zip(master_segs, new_segs):
+            gaps = max(mg, ng)
+            result.extend(['-'] * gaps)
+            result_map.extend([-1] * gaps)
+            result.append(mc)
+            result_map.append(mpos)
+
+        trailing = max(trailing_gaps_master, trailing_gaps_new)
+        result.extend(['-'] * trailing)
+        result_map.extend([-1] * trailing)
+
+        return result, result_map
+
+    def _reconcile_center_fallback(self, master: List[str], master_map: List[int],
+                                    new_center: str) -> Tuple[List[str], List[int]]:
+        """Original character-walking reconciliation, used as fallback."""
         result = []
         result_map = []
-        
         master_idx = 0
         new_idx = 0
-        
+
         while master_idx < len(master) or new_idx < len(new_center):
             if master_idx >= len(master):
-                # Master exhausted, add from new
                 result.append(new_center[new_idx])
-                result_map.append(-1)  # No mapping for this gap
+                result_map.append(-1)
                 new_idx += 1
             elif new_idx >= len(new_center):
-                # New exhausted, add from master
                 result.append(master[master_idx])
                 result_map.append(master_map[master_idx])
                 master_idx += 1
             elif master[master_idx] == '-' and new_center[new_idx] == '-':
-                # Both have gaps
                 result.append('-')
                 result_map.append(-1)
                 master_idx += 1
                 new_idx += 1
             elif master[master_idx] == '-':
-                # Master has gap, new doesn't - keep master's gap
                 result.append('-')
                 result_map.append(master_map[master_idx])
                 master_idx += 1
             elif new_center[new_idx] == '-':
-                # New has gap, master doesn't - insert gap into master
                 result.append('-')
                 result_map.append(-1)
                 new_idx += 1
             else:
-                # Both have characters - should match
                 result.append(master[master_idx])
                 result_map.append(master_map[master_idx])
                 master_idx += 1
                 new_idx += 1
-        
+
         return result, result_map
     
     def _apply_master_gaps(self, pair_center: str, pair_other: str,
