@@ -559,6 +559,260 @@ class CenterStarAligner:
 
         return current
 
+    def iterative_refine(self, alignment: Alignment,
+                         gap_open: int, gap_extend: int,
+                         word_size: int, evalue: float,
+                         identity_threshold: float = 70.0,
+                         max_iterations: int = 5,
+                         coverage_threshold: float = 0.5,
+                         max_hsps: int = 1,
+                         verbose: bool = False) -> Alignment:
+        """
+        Iterative center-star refinement for poorly-aligned sequences.
+
+        Each iteration:
+          1. Find sequences below identity_threshold (within-subgroup check)
+          2. Build a new center-star MSA from only those sequences
+          3. Merge the sub-MSA back into the main alignment via bridge alignment
+          4. Repeat with sequences still below threshold within their sub-group
+
+        Stops when the poor set stops shrinking or drops below 2 sequences.
+        """
+        scores = compute_per_sequence_identity(alignment)
+        current_poor = {sid for sid, s in scores.items() if s < identity_threshold}
+
+        if verbose:
+            print(f"  Iterative centerstar: {len(current_poor)} sequences "
+                  f"below {identity_threshold:.0f}% identity")
+
+        for iteration in range(max_iterations):
+            if len(current_poor) < 2:
+                if verbose:
+                    print(f"  Iteration {iteration + 1}: group too small, stopping")
+                break
+
+            if verbose:
+                print(f"  Iteration {iteration + 1}: sub-aligning "
+                      f"{len(current_poor)} sequences...")
+
+            sub_seqs = [self.sequences[sid] for sid in current_poor
+                        if sid in self.sequences]
+
+            with BlastRunner(self.seq_type) as runner:
+                sub_hits = runner.run_all_pairwise(
+                    sub_seqs,
+                    gap_open=gap_open,
+                    gap_extend=gap_extend,
+                    word_size=word_size,
+                    evalue=evalue,
+                    verbose=False,
+                    coverage_threshold=coverage_threshold,
+                    max_hsps=max_hsps
+                )
+
+            # Build sub-MSA with auto-selected center
+            sub_aligner = CenterStarAligner(sub_seqs, self.seq_type)
+            sub_msa = sub_aligner.build_msa(sub_hits)
+
+            sub_scores = compute_per_sequence_identity(sub_msa)
+            still_poor = {sid for sid, s in sub_scores.items()
+                          if s < identity_threshold}
+
+            auto_improved = current_poor - still_poor
+
+            if verbose:
+                print(f"    Auto-center: {len(auto_improved)} improved, "
+                      f"{len(still_poor)} still below threshold")
+
+            if not auto_improved:
+                # Auto-center stalled — try each candidate as center
+                if verbose:
+                    print(f"    Stalled. Trying exhaustive center search "
+                          f"({len(current_poor)} candidates)...")
+
+                best_sub_msa = sub_msa
+                best_still_poor = still_poor
+                found_improvement = False
+
+                for candidate_id in sorted(current_poor):
+                    cand_aligner = CenterStarAligner(sub_seqs, self.seq_type)
+                    cand_msa = cand_aligner.build_msa(sub_hits, center_id=candidate_id)
+                    cand_scores = compute_per_sequence_identity(cand_msa)
+                    cand_still_poor = {sid for sid, s in cand_scores.items()
+                                       if s < identity_threshold}
+                    cand_improved = current_poor - cand_still_poor
+
+                    if verbose:
+                        print(f"      Center {candidate_id}: "
+                              f"{len(cand_improved)} improved")
+
+                    if cand_improved:
+                        best_sub_msa = cand_msa
+                        best_still_poor = cand_still_poor
+                        found_improvement = True
+                        break
+
+                alignment = self._merge_sub_msa(
+                    alignment, best_sub_msa, current_poor, verbose,
+                    max_hsps=max_hsps)
+                current_poor = best_still_poor
+
+                if not found_improvement:
+                    if verbose:
+                        print(f"    Exhaustive search exhausted, stopping")
+                    break
+            else:
+                alignment = self._merge_sub_msa(
+                    alignment, sub_msa, current_poor, verbose,
+                    max_hsps=max_hsps)
+                current_poor = still_poor
+
+            if not current_poor:
+                if verbose:
+                    print(f"  All sequences resolved after {iteration + 1} iteration(s)")
+                break
+
+        return alignment
+
+    def _merge_sub_msa(self, main_alignment: Alignment, sub_msa: Alignment,
+                        poor_ids: set, verbose: bool = False,
+                        max_hsps: int = 3) -> Alignment:
+        """
+        Merge a sub-MSA back into the main alignment using a bridge alignment.
+
+          1. Build consensus from the well-aligned (non-poor) sequences in main
+          2. Build consensus from the sub-MSA
+          3. BLAST sub-consensus against main-consensus (bridge)
+          4. For each poor sequence: map sub-MSA columns → sub-consensus positions
+             → main-consensus positions → main-MSA columns (double mapping)
+          5. Replace poor sequences in main alignment with remapped versions
+        """
+        good_seqs = [s for s in main_alignment.sequences if s.id not in poor_ids]
+        if len(good_seqs) < 2:
+            if verbose:
+                print("    Too few good sequences for bridge, skipping merge")
+            return main_alignment
+
+        good_alignment = Alignment(sequences=good_seqs, seq_type=main_alignment.seq_type)
+        main_consensus = build_consensus(good_alignment, gap_threshold=0.5)
+        sub_consensus = build_consensus(sub_msa, gap_threshold=0.5)
+
+        if not main_consensus or not sub_consensus:
+            if verbose:
+                print("    Could not build consensus for bridge, skipping merge")
+            return main_alignment
+
+        # Bridge: BLAST sub-consensus (query) against main-consensus (subject)
+        sub_cons_seq = Sequence(id='sub_consensus', description='', seq=sub_consensus)
+        if verbose and max_hsps > 1:
+            print(f"    Bridge BLAST (sub-consensus vs main-consensus, max_hsps={max_hsps}):")
+        with BlastRunner(self.seq_type) as runner:
+            bridge_hit = runner.run_vs_consensus(
+                sub_cons_seq, main_consensus,
+                gap_open=5 if self.seq_type != SeqType.PROTEIN else 11,
+                gap_extend=2 if self.seq_type != SeqType.PROTEIN else 1,
+                word_size=7 if self.seq_type != SeqType.PROTEIN else 2,
+                evalue=1e-3,
+                max_hsps=max_hsps,
+                verbose=verbose
+            )
+
+        if bridge_hit is None:
+            if verbose:
+                print("    Bridge alignment failed, keeping original positions")
+            return main_alignment
+
+        # Extend bridge to full length: seq1=sub-consensus, seq2=main-consensus
+        bridge_pair = extend_pairwise_alignment(bridge_hit, sub_consensus, main_consensus)
+
+        # Precompute: for each poor sequence, its characters at sub-consensus positions
+        sub_msa_seqs = {s.id: s.seq for s in sub_msa.sequences}
+
+        refined_seqs = list(good_seqs)
+
+        for sid in poor_ids:
+            if sid not in sub_msa_seqs:
+                orig = next((s for s in main_alignment.sequences if s.id == sid), None)
+                if orig:
+                    refined_seqs.append(orig)
+                continue
+
+            seq_chars = self._seq_chars_at_sub_consensus(sub_msa_seqs[sid], sub_msa)
+
+            # Double-map: sub-MSA → sub-consensus positions → bridge space → main-MSA columns
+            seq_in_bridge = self._map_through_bridge(
+                seq_chars, bridge_pair.seq1_aligned, bridge_pair.seq2_aligned
+            )
+            aligned_seq = self._map_to_msa_columns(
+                seq_in_bridge, bridge_pair.seq2_aligned, good_alignment
+            )
+
+            orig_seq = self.sequences[sid]
+            refined_seqs.append(Sequence(
+                id=sid,
+                description=orig_seq.description,
+                seq=aligned_seq
+            ))
+
+        max_len = max(len(s.seq) for s in refined_seqs)
+        for s in refined_seqs:
+            if len(s.seq) < max_len:
+                s.seq = s.seq + '-' * (max_len - len(s.seq))
+
+        return Alignment(
+            sequences=refined_seqs,
+            seq_type=main_alignment.seq_type,
+            parameters=main_alignment.parameters,
+            score=main_alignment.score
+        )
+
+    def _seq_chars_at_sub_consensus(self, seq_in_sub_msa: str,
+                                     sub_msa: Alignment) -> Dict[int, str]:
+        """
+        Derive the character a sequence has at each sub-consensus position.
+
+        Walks sub-MSA columns; non-gap-heavy columns contribute to the
+        sub-consensus (same logic as build_consensus). Returns a dict mapping
+        sub-consensus position (0-based) → the sequence's character there.
+        """
+        sequences = [s.seq for s in sub_msa.sequences]
+        n_seqs = len(sequences)
+        result = {}
+        sub_cons_pos = 0
+
+        for col in range(sub_msa.length):
+            column = [seq[col] for seq in sequences]
+            if column.count('-') / n_seqs > 0.5:
+                continue  # gap-heavy: skipped in sub-consensus
+            result[sub_cons_pos] = seq_in_sub_msa[col]
+            sub_cons_pos += 1
+
+        return result
+
+    def _map_through_bridge(self, seq_chars: Dict[int, str],
+                             sub_cons_aligned: str,
+                             main_cons_aligned: str) -> str:
+        """
+        Map a sequence (by its sub-consensus-position characters) into the
+        bridge pairwise alignment coordinate space (aligned to main-consensus).
+
+        sub_cons_aligned and main_cons_aligned are the two sides of the extended
+        bridge alignment (same length). Returns a string of the same length
+        representing the sequence aligned to main-consensus.
+        """
+        result = []
+        sub_cons_pos = 0
+
+        for i in range(len(sub_cons_aligned)):
+            if sub_cons_aligned[i] != '-':
+                result.append(seq_chars.get(sub_cons_pos, '-'))
+                sub_cons_pos += 1
+            else:
+                # Main-consensus has an insertion here relative to sub-consensus
+                result.append('-')
+
+        return ''.join(result)
+
     def _map_to_msa_columns(self, seq_aligned_to_consensus: str,
                              consensus_aligned: str,
                              good_alignment: Alignment) -> str:

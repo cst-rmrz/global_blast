@@ -94,7 +94,10 @@ def _run_single_blast(args: Tuple) -> Tuple[Tuple[str, str], Optional[BlastHit],
 
 def _execute_blast(query_path: Path, subject_path: Path, blast_cmd: str,
                    gap_open: int, gap_extend: int, word_size: int,
-                   evalue: float, max_hsps: int = 1) -> Optional[BlastHit]:
+                   evalue: float, max_hsps: int = 1,
+                   reward: Optional[int] = None,
+                   penalty: Optional[int] = None,
+                   verbose: bool = False) -> Optional[BlastHit]:
     """Execute a single BLAST command and parse result."""
     cmd = [
         blast_cmd,
@@ -108,6 +111,8 @@ def _execute_blast(query_path: Path, subject_path: Path, blast_cmd: str,
         '-max_target_seqs', '1',
         '-max_hsps', str(max_hsps)
     ]
+    if blast_cmd == 'blastn' and reward is not None and penalty is not None:
+        cmd += ['-reward', str(reward), '-penalty', str(penalty)]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -142,6 +147,7 @@ def _execute_blast(query_path: Path, subject_path: Path, blast_cmd: str,
     # Multi-HSP mode: pick the HSP with best query coverage
     best_hit = None
     best_coverage = 0.0
+    hsp_index = 0
 
     for line in output.split('\n'):
         if not line:
@@ -169,11 +175,23 @@ def _execute_blast(query_path: Path, subject_path: Path, blast_cmd: str,
             qlen = int(fields[11])
             coverage = hit.query_len_aligned / qlen if qlen > 0 else 0.0
         else:
+            qlen = 0
             coverage = hit.query_len_aligned  # fallback: prefer longer alignments
+
+        if verbose:
+            print(f"      HSP {hsp_index + 1}: {hit.query_id} vs {hit.subject_id} "
+                  f"coverage={coverage:.0%} identity={hit.identity:.1f}% "
+                  f"bitscore={hit.bitscore:.1f} "
+                  f"q={hit.query_start}-{hit.query_end}"
+                  + (f"/{qlen}" if qlen else ""))
+        hsp_index += 1
 
         if coverage > best_coverage:
             best_coverage = coverage
             best_hit = hit
+
+    if verbose and best_hit is not None:
+        print(f"      -> selected HSP with coverage={best_coverage:.0%}")
 
     return best_hit
 
@@ -320,7 +338,10 @@ class BlastRunner:
     
     def run_against_database(self, queries: List[Sequence], db_path: Path,
                               gap_open: int, gap_extend: int, word_size: int,
-                              evalue: float, threads: int = 1) -> Dict[Tuple[str, str], BlastHit]:
+                              evalue: float, threads: int = 1,
+                              reward: Optional[int] = None,
+                              penalty: Optional[int] = None,
+                              max_hsps: int = 1) -> Dict[Tuple[str, str], BlastHit]:
         """
         Run all query sequences against a BLAST database in a single call.
         
@@ -354,10 +375,12 @@ class BlastRunner:
             '-evalue', str(evalue),
             '-outfmt', '6 qseqid sseqid qstart qend sstart send qseq sseq evalue bitscore pident qlen slen',
             '-max_target_seqs', str(max(n_seqs + 5, 10)),  # Get enough hits
-            '-max_hsps', '1',
+            '-max_hsps', str(max_hsps),
             '-num_threads', str(threads)
         ]
-        
+        if self.blast_cmd == 'blastn' and reward is not None and penalty is not None:
+            cmd += ['-reward', str(reward), '-penalty', str(penalty)]
+
         result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode != 0 and 'error' in result.stderr.lower():
@@ -379,7 +402,9 @@ class BlastRunner:
     
     def run_reference_vs_others(self, reference: Sequence, others: List[Sequence],
                                  gap_open: int, gap_extend: int, word_size: int,
-                                 evalue: float, threads: int = None) -> Dict[Tuple[str, str], BlastHit]:
+                                 evalue: float, threads: int = None,
+                                 reward: Optional[int] = None,
+                                 penalty: Optional[int] = None) -> Dict[Tuple[str, str], BlastHit]:
         """
         Efficiently align a reference sequence against all others.
         
@@ -396,14 +421,16 @@ class BlastRunner:
         # Forward: others query against reference DB
         ref_db = self.create_database([reference], db_name='ref_db')
         forward_hits = self.run_against_database(
-            others, ref_db, gap_open, gap_extend, word_size, evalue, threads
+            others, ref_db, gap_open, gap_extend, word_size, evalue, threads,
+            reward=reward, penalty=penalty
         )
         hits.update(forward_hits)
-        
+
         # Reverse: reference query against others DB
         others_db = self.create_database(others, db_name='others_db')
         reverse_hits = self.run_against_database(
-            [reference], others_db, gap_open, gap_extend, word_size, evalue, threads
+            [reference], others_db, gap_open, gap_extend, word_size, evalue, threads,
+            reward=reward, penalty=penalty
         )
         hits.update(reverse_hits)
         
@@ -441,7 +468,10 @@ class BlastRunner:
                          word_size: int = None, evalue: float = 1e-5,
                          verbose: bool = False,
                          threads: int = None,
-                         coverage_threshold: float = 0.5) -> Dict[Tuple[str, str], BlastHit]:
+                         coverage_threshold: float = 0.5,
+                         reward: Optional[int] = None,
+                         penalty: Optional[int] = None,
+                         max_hsps: int = 1) -> Dict[Tuple[str, str], BlastHit]:
         """
         Run all pairwise BLASTs between sequences.
 
@@ -479,7 +509,8 @@ class BlastRunner:
 
         # BLAST all sequences against the database
         hits = self.run_against_database(
-            sequences, all_db, gap_open, gap_extend, word_size, evalue, threads
+            sequences, all_db, gap_open, gap_extend, word_size, evalue, threads,
+            reward=reward, penalty=penalty, max_hsps=max_hsps
         )
 
         if verbose:
@@ -573,7 +604,9 @@ class BlastRunner:
 
     def run_vs_consensus(self, query: Sequence, consensus_seq: str,
                           gap_open: int = 5, gap_extend: int = 2,
-                          word_size: int = 7, evalue: float = 1e-3) -> Optional[BlastHit]:
+                          word_size: int = 7, evalue: float = 1e-3,
+                          max_hsps: int = 3,
+                          verbose: bool = False) -> Optional[BlastHit]:
         """
         BLAST a single sequence against a consensus string.
 
@@ -590,7 +623,8 @@ class BlastRunner:
 
         return _execute_blast(
             query_path, subject_path, self.blast_cmd,
-            gap_open, gap_extend, word_size, evalue, max_hsps=3
+            gap_open, gap_extend, word_size, evalue, max_hsps=max_hsps,
+            verbose=verbose
         )
 
 
