@@ -728,7 +728,9 @@ class CenterStarAligner:
 
             blast_ids = [sid for sid in poor_ids if sid not in leading_gap_ids]
 
-            # NW path: global align ungapped sequence to consensus, then map to MSA
+            # NW path: global align ungapped sequence to consensus, then map to MSA.
+            # Pure global NW correctly removes spurious leading gaps by forcing
+            # alignment from position 0.
             nw_aligned = {}
             for sid in leading_gap_ids:
                 ungapped = self.sequences[sid].seq.replace('-', '')

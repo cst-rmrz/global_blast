@@ -178,6 +178,52 @@ def _execute_blast(query_path: Path, subject_path: Path, blast_cmd: str,
     return best_hit
 
 
+def _execute_blast_all_hsps(query_path: Path, subject_path: Path, blast_cmd: str,
+                             gap_open: int, gap_extend: int, word_size: int,
+                             evalue: float, max_hsps: int = 10) -> List[BlastHit]:
+    """Execute a BLAST command and return ALL HSPs as a list sorted by query_start."""
+    cmd = [
+        blast_cmd,
+        '-query', str(query_path),
+        '-subject', str(subject_path),
+        '-gapopen', str(gap_open),
+        '-gapextend', str(gap_extend),
+        '-word_size', str(word_size),
+        '-evalue', str(evalue),
+        '-outfmt', '6 qseqid sseqid qstart qend sstart send qseq sseq evalue bitscore pident qlen slen',
+        '-max_target_seqs', '1',
+        '-max_hsps', str(max_hsps)
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+
+    hits = []
+    for line in result.stdout.strip().split('\n'):
+        if not line:
+            continue
+        fields = line.split('\t')
+        if len(fields) < 11:
+            continue
+        hits.append(BlastHit(
+            query_id=fields[0],
+            subject_id=fields[1],
+            query_start=int(fields[2]),
+            query_end=int(fields[3]),
+            subject_start=int(fields[4]),
+            subject_end=int(fields[5]),
+            query_seq=fields[6],
+            subject_seq=fields[7],
+            evalue=float(fields[8]),
+            bitscore=float(fields[9]),
+            identity=float(fields[10])
+        ))
+
+    hits.sort(key=lambda h: h.query_start)
+    return hits
+
+
 def _retry_single_pair(args: Tuple) -> Tuple[Tuple[str, str], Optional[BlastHit], Optional[BlastHit]]:
     """
     Worker function for parallel coverage-guard retries.
@@ -699,6 +745,37 @@ class BlastRunner:
             return rev
 
         return fwd if fwd.identity >= rev.identity else rev
+
+    def run_vs_consensus_multi_hsp(self, query_seq: str, query_id: str,
+                                    consensus_seq: str,
+                                    gap_open: int = 5, gap_extend: int = 2,
+                                    word_size: int = 7, evalue: float = 1e-3,
+                                    max_hsps: int = 10) -> List[BlastHit]:
+        """
+        BLAST a single sequence against a consensus, returning all HSPs sorted
+        by query_start. Used by synteny-aware refinement to feed chain_blast_hsps.
+        HSPs are returned with query_id=query_id, subject_id='consensus'.
+        """
+        import uuid
+        pair_id = uuid.uuid4().hex[:8]
+        query_path = Path(self.temp_dir) / f'refine_mhsp_q_{pair_id}.fasta'
+        subject_path = Path(self.temp_dir) / f'refine_mhsp_s_{pair_id}.fasta'
+
+        try:
+            with open(query_path, 'w') as f:
+                f.write(f">{query_id}\n{query_seq}\n")
+            with open(subject_path, 'w') as f:
+                f.write(f">consensus\n{consensus_seq}\n")
+
+            return _execute_blast_all_hsps(
+                query_path, subject_path, self.blast_cmd,
+                gap_open, gap_extend, word_size, evalue, max_hsps=max_hsps
+            )
+        finally:
+            if query_path.exists():
+                query_path.unlink()
+            if subject_path.exists():
+                subject_path.unlink()
 
 
 def compute_pairwise_scores(hits: Dict[Tuple[str, str], BlastHit],
